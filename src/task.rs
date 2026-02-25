@@ -1,11 +1,13 @@
+use pyo3::{
+    exceptions::{PyStopIteration},
+    prelude::*,
+};
 use std::{cell::RefCell, sync::Arc};
-use pyo3::{exceptions::PyStopIteration, prelude::*};
 
 pub type TaskId = usize;
 
 struct Task {
     coro: Py<PyAny>,
-    task_id: TaskId
 }
 
 pub enum StepResult {
@@ -15,66 +17,82 @@ pub enum StepResult {
 }
 
 impl Task {
-    fn new(coro: &Bound<'_, PyAny>, task_id: TaskId) -> Self {
+    fn new(coro: &Bound<'_, PyAny>) -> Self {
         if !coro.hasattr("send").unwrap_or(false) {
             panic!("Function must be a generator");
         }
         Task {
             coro: coro.clone().unbind(),
-            task_id: task_id
         }
     }
 
-    fn step(&self, val: Option<PyObject>, py: Python) -> StepResult {
+    fn call_method<F>(&self, method: F, py: Python) -> StepResult
+    where
+        F: FnOnce(&Bound<'_, PyAny>) -> PyResult<PyObject>,
+    {
         let coro = self.coro.bind(py);
-        let send_attr = match coro.getattr("send") {
-            Err(e) => return StepResult::Failure(e),
-            Ok(s) => s
-        };
-        let to_send = match val {
-            None => py.None(),
-            Some(x) => x
-        };
-        match send_attr.call1((to_send,)) {
-            Ok(res) => {
-                StepResult::Yield(res.into())
-            }
-            Err(err) => {
-                if err.is_instance_of::<PyStopIteration>(py) {
-                    let exc_value = err.value(py);
-                    
-                    let result_obj: PyObject = exc_value
+
+        match method(coro) {
+            Ok(res) => StepResult::Yield(res),
+            Err(e) => {
+                if e.is_instance_of::<PyStopIteration>(py) {
+                    let exc_value = e.value(py);
+
+                    let res_obj: PyObject = exc_value
                         .getattr("value")
                         .map(|b| b.into())
-                        .unwrap_or_else(|_| py.None());
-                    StepResult::Success(result_obj.into())
-                }
-                else {
-                    StepResult::Failure(err)
+                        .unwrap_or_else(|_| py.None())
+                        .into();
+                    StepResult::Success(res_obj)
+                } else {
+                    StepResult::Failure(e)
                 }
             }
-
         }
+    }
+
+    fn throw(&self, err: PyErr, py: Python) -> StepResult {
+        self.call_method(
+            |coro| {
+                let throw_method = coro.getattr("throw")?;
+                Ok(throw_method.call1((err.value(py),))?.into())
+            },
+            py,
+        )
+    }
+
+    fn step(&self, val: Option<PyObject>, py: Python) -> StepResult {
+        self.call_method(
+            |coro| {
+                let send_method = coro.getattr("send")?;
+                let val_send = match val {
+                    Some(x) => x,
+                    None => py.None(),
+                };
+                Ok(send_method.call1((val_send,))?.into())
+            },
+            py,
+        )
     }
 }
 
 #[derive(Clone)]
 pub struct RustTask {
-    inner: Arc<RefCell<Task>>
+    inner: Arc<RefCell<Task>>,
 }
 
 impl RustTask {
-    pub fn new(coro: &Bound<'_, PyAny>, task_id: TaskId) -> Self {
+    pub fn new(coro: &Bound<'_, PyAny>) -> Self {
         RustTask {
-            inner: Arc::new(
-                RefCell::new(
-                    Task::new(coro, task_id)
-                )
-            )
+            inner: Arc::new(RefCell::new(Task::new(coro))),
         }
     }
 
     pub fn step(&self, val: Option<PyObject>, py: Python) -> StepResult {
         self.inner.borrow().step(val, py)
+    }
+
+    pub fn throw(&self, err: PyErr, py: Python) -> StepResult {
+        self.inner.borrow().throw(err, py)
     }
 }

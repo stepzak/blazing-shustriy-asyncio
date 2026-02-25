@@ -1,7 +1,9 @@
 use std::{cell::RefCell, sync::Arc};
 
-use pyo3::{IntoPyObjectExt, call, exceptions::{self, PyRuntimeError}, ffi::PyErr_NewException, prelude::*};
-
+use pyo3::{
+    exceptions::{PyRuntimeError},
+    prelude::*,
+};
 
 type CallbackSuccess = Box<dyn FnOnce(PyObject)>;
 type CallbackErr = Box<dyn FnOnce(PyErr)>;
@@ -9,13 +11,13 @@ type CallbackErr = Box<dyn FnOnce(PyErr)>;
 enum FutureState {
     Pending,
     Success(PyObject),
-    Failure(PyErr)
+    Failure(PyErr),
 }
 
 struct Future {
     state: FutureState,
     waiters_success: Option<Vec<CallbackSuccess>>,
-    waiters_err: Option<Vec<CallbackErr>>
+    waiters_err: Option<Vec<CallbackErr>>,
 }
 
 impl Future {
@@ -23,18 +25,20 @@ impl Future {
         Future {
             state: FutureState::Pending,
             waiters_success: Some(Vec::new()),
-            waiters_err: Some(Vec::new())
+            waiters_err: Some(Vec::new()),
         }
     }
 
-    fn add_callback<F>(&mut self, callback: F, py: Python) 
-    where F: FnOnce(PyObject) + 'static {
+    fn add_callback<F>(&mut self, callback: F, py: Python)
+    where
+        F: FnOnce(PyObject) + 'static,
+    {
         match &self.state {
             FutureState::Pending => {
                 if let Some(vec) = self.waiters_success.as_mut() {
                     vec.push(Box::new(callback));
                 }
-            },
+            }
 
             FutureState::Success(res) => callback(res.clone_ref(py)),
             _ => {}
@@ -42,28 +46,30 @@ impl Future {
     }
 
     fn add_err_callback<F>(&mut self, callback: F, py: Python)
-    where F: FnOnce(PyErr) + 'static {
+    where
+        F: FnOnce(PyErr) + 'static,
+    {
         match &self.state {
             FutureState::Pending => {
                 if let Some(vec) = self.waiters_err.as_mut() {
                     vec.push(Box::new(callback))
                 }
-            },
+            }
 
             FutureState::Failure(e) => {
                 callback(e.clone_ref(py));
-            },
+            }
             _ => {}
         }
     }
 
     fn set_result(&mut self, res: PyObject, py: Python) -> PyResult<()> {
-        let callbacks = match &self.state  {
+        let callbacks = match &self.state {
             FutureState::Pending => {
                 self.state = FutureState::Success(res.clone_ref(py));
                 self.waiters_err.take();
                 self.waiters_success.take().unwrap_or_default()
-            },
+            }
 
             _ => {
                 return Err(PyRuntimeError::new_err("Future already finished"));
@@ -81,8 +87,7 @@ impl Future {
                 self.state = FutureState::Failure(exc.clone_ref(py));
                 self.waiters_success.take();
                 self.waiters_err.take().unwrap_or_default()
-                
-            },
+            }
 
             _ => {
                 return Err(PyRuntimeError::new_err("Future already finished"));
@@ -101,36 +106,36 @@ impl Future {
 
     fn result(&self, py: Python) -> PyResult<Option<PyObject>> {
         match &self.state {
-            FutureState::Pending => {
-                Err(PyRuntimeError::new_err("Future is not yet finished"))
-            },
-            FutureState::Success(val) => {
-                Ok(Some(val.clone_ref(py)))
-            },
-            FutureState::Failure(e) => {
-                Err(e.clone_ref(py))
-            }
+            FutureState::Pending => Err(PyRuntimeError::new_err("Future is not yet finished")),
+            FutureState::Success(val) => Ok(Some(val.clone_ref(py))),
+            FutureState::Failure(e) => Err(e.clone_ref(py)),
         }
     }
 }
 
 #[derive(Clone)]
 pub struct RustFuture {
-    inner: Arc<RefCell<Future>>
+    inner: Arc<RefCell<Future>>,
 }
 
 impl RustFuture {
     pub fn new() -> Self {
-        RustFuture { inner: Arc::new(RefCell::new(Future::new())) }
+        RustFuture {
+            inner: Arc::new(RefCell::new(Future::new())),
+        }
     }
 
     pub fn add_callback<F>(&self, callback: F, py: Python)
-    where F: FnOnce(PyObject) + 'static {
+    where
+        F: FnOnce(PyObject) + 'static,
+    {
         self.inner.borrow_mut().add_callback(callback, py);
     }
 
     pub fn add_err_callback<F>(&self, callback: F, py: Python)
-    where F: FnOnce(PyErr) + 'static {
+    where
+        F: FnOnce(PyErr) + 'static,
+    {
         self.inner.borrow_mut().add_err_callback(callback, py);
     }
 
@@ -153,14 +158,16 @@ impl RustFuture {
 
 #[pyclass(unsendable)]
 pub struct PyFuture {
-    pub future: RustFuture
+    pub future: RustFuture,
 }
 
 #[pymethods]
 impl PyFuture {
     #[new]
     pub fn new() -> Self {
-        PyFuture { future: RustFuture::new() }
+        PyFuture {
+            future: RustFuture::new(),
+        }
     }
 
     pub fn set_result(&self, py: Python, val: PyObject) -> PyResult<()> {
@@ -171,4 +178,3 @@ impl PyFuture {
         self.future.is_done()
     }
 }
-

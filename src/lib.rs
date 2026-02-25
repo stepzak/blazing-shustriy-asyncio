@@ -1,9 +1,8 @@
 use pyo3::prelude::*;
 
+mod event_loop;
 mod future;
 mod task;
-mod event_loop;
-
 
 /// A Python module implemented in Rust.
 #[pymodule]
