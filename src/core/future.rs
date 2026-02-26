@@ -160,6 +160,12 @@ pub struct PyFuture {
     pub future: RustFuture,
 }
 
+impl From<RustFuture> for PyFuture {
+    fn from(value: RustFuture) -> Self {
+        PyFuture {future: value}
+    }
+}
+
 #[pymethods]
 impl PyFuture {
     #[new]

@@ -1,5 +1,5 @@
 use std::{cell::RefCell, collections::VecDeque, sync::Arc};
-
+use super::helpers;
 use pyo3::prelude::*;
 use crate::core::future::{PyFuture, RustFuture};
 
@@ -80,8 +80,7 @@ impl PyLock {
 
     pub fn acquire(&self, py: Python) -> PyResult<PyFuture> {
         let fut = self.lock.acquire(py)?;
-        let mut pyfut = PyFuture::new();
-        pyfut.future = fut;
+        let pyfut: PyFuture = fut.into();
         return Ok(pyfut);
     }
 
@@ -94,9 +93,7 @@ impl PyLock {
     }
 
     fn __aenter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<PyObject> {
-        let fut = slf.lock.acquire(py)?;
-        let py_fut = PyFuture { future: fut };
-        Ok(Py::new(py, py_fut)?.into_any())
+        helpers::primitive_aenter(|p| slf.acquire(p), py)
     }
 
     pub fn __aexit__(
@@ -105,7 +102,6 @@ impl PyLock {
         _exc_type: Option<&Bound<'_, PyAny>>,
         _exc_val: Option<&Bound<'_, PyAny>>,
         _exc_tb: Option<&Bound<'_, PyAny>>,) -> PyResult<Option<PyObject>> {
-            self.release(py)?;
-            Ok(None)
+            helpers::primitive_aexit(|p| self.release(p), py)
     }
 }

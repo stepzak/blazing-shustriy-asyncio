@@ -1,5 +1,5 @@
 from .core.event_loop import EventLoop
-from .sync.lock import Lock
+from .sync import *
 from .core.helpers import _AsyncGather, _AsyncSleep, sleep, gather
 
 __all__ = [
@@ -8,5 +8,6 @@ __all__ = [
     "sleep",
     "gather",
     "_AsyncSleep",
-    "_AsyncGather"
+    "_AsyncGather",
+    "Semaphore"
 ]
