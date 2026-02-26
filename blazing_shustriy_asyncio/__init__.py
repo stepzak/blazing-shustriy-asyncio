@@ -9,5 +9,6 @@ __all__ = [
     "gather",
     "_AsyncSleep",
     "_AsyncGather",
-    "Semaphore"
+    "Semaphore",
+    "Event"
 ]

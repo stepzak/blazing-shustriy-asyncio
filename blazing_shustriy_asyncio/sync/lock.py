@@ -12,6 +12,8 @@ class Lock:
         ...
     ```
     """
+    __slots__ = ("_impl",)
+    
     def __init__(self) -> None:
         self._impl: _rc.sync.PyLock = _rc.sync.PyLock()
 

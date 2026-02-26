@@ -12,6 +12,8 @@ class Semaphore:
         ...
     ```
     """
+    __slots__ = ("_impl",)
+
     def __init__(self, max_busy: int) -> None:
         self._impl: _rc.sync.PyLock = _rc.sync.PySemaphore(max_busy)
 

@@ -370,7 +370,6 @@ impl EventLoop {
         let id = self.next_id - 1;
         self.schedule_task(id);
         self.run_forever(py)
-    
     }
 }
 

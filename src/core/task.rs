@@ -1,7 +1,4 @@
-use pyo3::{
-    exceptions::{PyStopIteration},
-    prelude::*,
-};
+use pyo3::{exceptions::PyStopIteration, prelude::*};
 use std::{cell::RefCell, sync::Arc};
 
 pub type TaskId = usize;

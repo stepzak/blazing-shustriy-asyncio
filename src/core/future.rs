@@ -1,7 +1,9 @@
 use std::{cell::RefCell, sync::Arc};
 
 use pyo3::{
-    IntoPyObjectExt, exceptions::{PyRuntimeError, PyStopIteration}, prelude::*
+    exceptions::{PyRuntimeError, PyStopIteration},
+    prelude::*,
+    IntoPyObjectExt,
 };
 
 pub type CallbackSuccess = Box<dyn FnOnce(PyObject)>;
@@ -162,7 +164,7 @@ pub struct PyFuture {
 
 impl From<RustFuture> for PyFuture {
     fn from(value: RustFuture) -> Self {
-        PyFuture {future: value}
+        PyFuture { future: value }
     }
 }
 
@@ -198,6 +200,5 @@ impl PyFuture {
         } else {
             Ok(Some(slf.into_py_any(py)?))
         }
-
     }
 }

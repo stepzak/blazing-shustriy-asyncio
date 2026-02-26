@@ -1,5 +1,5 @@
+use crate::core::future::PyFuture;
 use pyo3::{prelude::*, PyResult};
-use crate::core::future::{PyFuture};
 
 pub fn primitive_aenter<F>(acquire_fn: F, py: Python) -> PyResult<PyObject>
 where
