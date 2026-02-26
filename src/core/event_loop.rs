@@ -16,8 +16,8 @@ use pyo3::{
 };
 
 use crate::{
-    future::{PyFuture, RustFuture},
-    task::{RustTask, StepResult, TaskId},
+    core::future::{PyFuture, RustFuture},
+    core::task::{RustTask, StepResult, TaskId},
 };
 
 struct Timer {
@@ -132,7 +132,7 @@ impl EventLoop {
                 Ok(x) => x,
                 Err(exc) => {
                     let fut = RustFuture::new();
-                    fut.set_exception(exc, py);
+                    let _ = fut.set_exception(exc, py);
                     return fut;
                 }
             }
@@ -181,6 +181,10 @@ impl EventLoop {
     }
 
     fn run_task(&mut self, py: Python, id: TaskId) -> PyResult<()> {
+        if !self.tasks_hm.contains_key(&id) {
+            return Ok(());
+        }
+
         let entry = self.tasks_hm.get_mut(&id).unwrap();
 
         if let Some(err) = entry.pending_err.take() {

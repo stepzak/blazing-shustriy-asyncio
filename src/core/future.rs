@@ -1,11 +1,10 @@
 use std::{cell::RefCell, sync::Arc};
 
 use pyo3::{
-    exceptions::{PyRuntimeError},
-    prelude::*,
+    IntoPyObjectExt, exceptions::{PyRuntimeError, PyStopIteration}, prelude::*
 };
 
-type CallbackSuccess = Box<dyn FnOnce(PyObject)>;
+pub type CallbackSuccess = Box<dyn FnOnce(PyObject)>;
 type CallbackErr = Box<dyn FnOnce(PyErr)>;
 
 enum FutureState {
@@ -176,5 +175,23 @@ impl PyFuture {
 
     pub fn is_done(&self) -> bool {
         self.future.is_done()
+    }
+
+    pub fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    pub fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    pub fn __next__(slf: PyRef<'_, Self>, py: Python) -> PyResult<Option<PyObject>> {
+        if slf.is_done() {
+            let res = slf.future.result(py)?;
+            Err(PyStopIteration::new_err(res.unwrap_or_else(|| py.None())))
+        } else {
+            Ok(Some(slf.into_py_any(py)?))
+        }
+
     }
 }

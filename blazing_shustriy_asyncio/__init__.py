@@ -22,17 +22,11 @@ class AsyncGather:
 async def sleep(duration: float):
     return await AsyncSleep(duration)
 
-class EventLoop:
-    __slots__ = ("_native_loop")
+async def gather(*coros):
+    return await AsyncGather(*coros)
 
-    def __init__(self):
-        self._native_loop = rust_core.PyEventLoop()
-    
-    def sleep(self, duration: float):
-        return AsyncSleep(duration)
-    
-    def gather(self, *coros):
-        return AsyncGather(*coros)
-    
-    def run_until_complete(self, main_coro):
-        self._native_loop.run_until_complete(main_coro)
+
+EventLoop = rust_core.PyEventLoop
+Lock = rust_core.sync.PyLock
+
+__all__ = ["EventLoop", "Lock", "sleep", "gather"]
