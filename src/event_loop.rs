@@ -126,10 +126,22 @@ impl EventLoop {
         })
     }
 
-    fn create_task(&mut self, gen: &Bound<'_, PyAny>) -> RustFuture {
+    fn create_task(&mut self, gen: &Bound<'_, PyAny>, py: Python) -> RustFuture {
+        let coro = if gen.hasattr("__await__").unwrap_or(false) {
+            match gen.call_method0("__await__") {
+                Ok(x) => x,
+                Err(exc) => {
+                    let fut = RustFuture::new();
+                    fut.set_exception(exc, py);
+                    return fut;
+                }
+            }
+        } else {
+            gen.clone()
+        };
         let id = self.next_id;
         self.next_id += 1;
-        let task = RustTask::new(gen);
+        let task = RustTask::new(&coro);
         let fut = RustFuture::new();
 
         self.tasks_hm.insert(
@@ -235,7 +247,7 @@ impl EventLoop {
             }
         }
         if val_binded.hasattr("send").unwrap_or(false) {
-            let child_future = self.create_task(val_binded.downcast()?);
+            let child_future = self.create_task(val_binded.downcast()?, py);
             let child_id = self.next_id - 1;
             self.schedule_task(child_id);
 
@@ -278,7 +290,7 @@ impl EventLoop {
             if !coro.hasattr("send").unwrap_or(false) {
                 return Err(PyRuntimeError::new_err("All args must be generators"));
             }
-            let child_fut = self.create_task(coro.downcast()?);
+            let child_fut = self.create_task(coro.downcast()?, py);
             let child_id = self.next_id - 1;
             self.schedule_task(child_id);
 
@@ -350,7 +362,7 @@ impl EventLoop {
     }
 
     fn run_until_complete(&mut self, coro: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
-        self.create_task(coro);
+        self.create_task(coro, py);
         let id = self.next_id - 1;
         self.schedule_task(id);
         self.run_forever(py)
@@ -367,8 +379,8 @@ impl RustEventLoop {
             event_loop: Arc::new(RefCell::new(EventLoop::new(py)?)),
         })
     }
-    pub fn create_task(&self, gen: &Bound<'_, PyAny>) -> RustFuture {
-        self.event_loop.borrow_mut().create_task(gen)
+    pub fn create_task(&self, gen: &Bound<'_, PyAny>, py: Python) -> RustFuture {
+        self.event_loop.borrow_mut().create_task(gen, py)
     }
     pub fn run_forever(&self, py: Python) -> PyResult<()> {
         self.event_loop.borrow_mut().run_forever(py)
@@ -392,7 +404,7 @@ impl PyEventLoop {
     }
     fn create_task(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
-        let fut = slf.borrow().loop_impl.create_task(gen);
+        let fut = slf.borrow().loop_impl.create_task(gen, py);
         Ok(Py::new(py, PyFuture { future: fut })?.into_any())
     }
 

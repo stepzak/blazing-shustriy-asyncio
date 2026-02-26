@@ -1,13 +1,13 @@
 import time
 from blazing_shustriy_asyncio import EventLoop, AsyncGather, AsyncSleep
 
-def worker(name: str, delay: str):
-    yield AsyncSleep(delay)
+async def worker(name: str, delay: str):
+    await AsyncSleep(delay)
     return f"Task {name} finished"
 
-def main():
+async def main():
     start = time.perf_counter()
-    results = yield AsyncGather(
+    results = await AsyncGather(
         worker("task 1", 0.5),
         worker("task 2", 0.8)
     )
