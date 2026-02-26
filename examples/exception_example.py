@@ -1,12 +1,12 @@
-from blazing_shustriy_asyncio import EventLoop, AsyncSleep
+from blazing_shustriy_asyncio import EventLoop, sleep
 
-def bad_task():
-    yield AsyncSleep(0.0)
+async def bad_task():
+    await sleep(0.0)
     raise Exception("Bruh")
 
-def main():
+async def main():
     try:
-        yield bad_task()
+        await bad_task()
     except Exception as ex:
         print(ex)
 

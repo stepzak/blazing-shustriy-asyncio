@@ -97,8 +97,8 @@ struct EventLoop {
 impl EventLoop {
     fn new(py: Python) -> PyResult<Self> {
         let module = PyModule::import(py, "blazing_shustriy_asyncio")?;
-        let sleep_t = module.getattr("AsyncSleep")?.unbind();
-        let gather_t = module.getattr("AsyncGather")?.unbind();
+        let sleep_t = module.getattr("_AsyncSleep")?.unbind();
+        let gather_t = module.getattr("_AsyncGather")?.unbind();
         let future_t = module
             .getattr("PyFuture")
             .ok()
