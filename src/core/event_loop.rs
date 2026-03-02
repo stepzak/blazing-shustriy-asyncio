@@ -14,6 +14,7 @@ use pyo3::{
     prelude::*,
     types::{PyList, PyTuple},
 };
+use tokio::runtime::Runtime;
 
 use crate::{
     core::future::{PyFuture, RustFuture},
@@ -92,6 +93,7 @@ struct EventLoop {
     future_type: Option<Py<PyAny>>,
     wake_rx: Receiver<(TaskId, Result<PyObject, PyErr>)>,
     wake_tx: Sender<(TaskId, Result<PyObject, PyErr>)>,
+    tokio_runtime: Runtime
 }
 
 impl EventLoop {
@@ -123,6 +125,7 @@ impl EventLoop {
             future_type: Some(future_t),
             wake_rx: rx,
             wake_tx: tx,
+            tokio_runtime: Runtime::new().unwrap()
         })
     }
 

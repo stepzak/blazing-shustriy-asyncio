@@ -1,243 +1,205 @@
-use std::{net::SocketAddr, sync::{Arc, Mutex}};
+use std::{net::SocketAddr, sync::Arc};
+use mio::net::{TcpListener as MioListener, TcpStream as MioStream};
 
-use pyo3::{IntoPyObjectExt, exceptions::{PyConnectionError, PyStopIteration}, prelude::*};
-use socket2::{Domain, Protocol, Socket, Type};
+use pyo3::{IntoPyObjectExt, exceptions::{PyConnectionError, PyOSError}, prelude::*};
 
-pub type OptionArc<T> = Option<Arc<Mutex<T>>>;
+
+#[pyclass]
+pub struct BindIo {
+    pub addr: SocketAddr,
+    pub pyclass: Py<PyTcpListener>
+}
+
+impl BindIo {
+    fn new(addr: SocketAddr, pylistener: Py<PyTcpListener>) -> Self {
+        BindIo {
+            addr,
+            pyclass: pylistener
+        }
+    }
+}
+
+#[pymethods]
+impl BindIo {
+    fn __await__(slf: PyRef<'_, Self>) -> PyResult<Py<BindIoGen>> {
+        let py = slf.py();
+        let gen = BindIoGen {
+            bind_io: slf.into(),
+            yielded: false
+        };
+        Ok(Py::new(py, gen)?)
+    }
+}
+
+#[pyclass]
+struct BindIoGen {
+    bind_io: Py<BindIo>,
+    yielded: bool
+}
+
+#[pymethods]
+impl BindIoGen {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
+        if !slf.yielded {
+            let py = slf.py();
+            slf.yielded = true;
+            if let Ok(bind_op) = slf.bind_io.extract::<PyRef<'_, BindIo>>(py) {
+                let addr = bind_op.addr;
+                let listener_ref = bind_op.pyclass.clone_ref(py);
+                
+                let result = (listener_ref, addr.to_string()).into_py_any(py).unwrap();
+                Some(result)
+            }
+            else {
+                None
+            }
+        }
+        else {
+            None
+        }
+    }
+}
 
 #[pyclass]
 pub struct ConnectIo {
     pub addr: SocketAddr,
-    pub yielded: bool
 }
 
 #[pymethods]
 impl ConnectIo {
     #[new]
-    fn new(addr: &str) -> PyResult<Self> {
-        let parsed = addr.parse::<SocketAddr>()?;
-        Ok(Self { addr: parsed, yielded: false })
+    pub fn new(addr: &str) -> PyResult<Self> {
+        let parsed = addr.parse::<SocketAddr>()
+        .map_err(|e| PyOSError::new_err(format!("Invalid address: {}", e)))?;
+        
+        Ok(ConnectIo { addr: parsed })
     }
 
-    fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
+    fn __await__(slf: PyRef<'_, Self>) -> PyResult<Py<ConnectIoGen>> {
+        let gen = ConnectIoGen {
+            addr: slf.addr,
+            yielded: false
+        };
 
+        Ok(Py::new(slf.py(), gen)?)
+    }
+}
+
+#[pyclass]
+struct ConnectIoGen {
+    addr: SocketAddr,
+    yielded: bool
+}
+
+#[pymethods]
+impl ConnectIoGen {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>>{
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
         if !slf.yielded {
             slf.yielded = true;
+            let op = ConnectIo {addr: slf.addr.clone()};
             let py = slf.py();
-            return Ok(Some(slf.into_py_any(py).unwrap()));
+            Some(op.into_py_any(py).unwrap())
         }
-        Err(PyStopIteration::new_err(slf.py().None()))
+        
+        else {
+            None
+        }
     }
 }
 
+
 #[pyclass(unsendable)]
 pub struct AcceptIo {
-    pub listener_arc: OptionArc<mio::net::TcpListener>,
-    pub yielded: bool
+    pub listener_arc: Arc<MioListener>,
 }
 
-impl From<Arc<Mutex<mio::net::TcpListener>>> for AcceptIo {
-    fn from(value: Arc<Mutex<mio::net::TcpListener>>) -> Self {
-        AcceptIo {
-            listener_arc: Some(value),
-            yielded: false
-        }
+impl From<Arc<MioListener>> for AcceptIo {
+    fn from(value: Arc<MioListener>) -> Self {
+        AcceptIo {listener_arc: value}
     }
 }
 
 #[pymethods]
 impl AcceptIo {
-
-    #[new]
-    pub fn new() -> PyResult<Self> {
-        Ok(AcceptIo {
-            listener_arc: None,
-            yielded: false
-        })
-    }
-
-    pub fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    pub fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>>{
-        if !slf.yielded {
-            slf.yielded = true;
-            let py = slf.py();
-            return Ok(Some(slf.into_py_any(py).unwrap()));
-        }
-        Err(PyStopIteration::new_err(slf.py().None()))
+    
+    fn __await__(slf: PyRef<'_, Self>) -> PyResult<Py<AcceptIoGen>> {
+        let gen = AcceptIoGen {
+            listener_arc: slf.listener_arc.clone(),
+            yielded: false,
+        };
+        Py::new(slf.py(), gen)
     }
 }
 
 
 #[pyclass(unsendable)]
-pub struct ReadIo {
-    pub listener_arc: OptionArc<mio::net::TcpStream>,
-    pub size: usize,
-    pub yielded: bool
+struct AcceptIoGen {
+    listener_arc: Arc<MioListener>,
+    yielded: bool
 }
 
 #[pymethods]
-impl ReadIo {
-
-    #[new]
-    pub fn new(size: usize) -> PyResult<Self> {
-        Ok(ReadIo {
-            listener_arc: None,
-            size,
-            yielded: false
-        })
-    }
-
-    pub fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+impl AcceptIoGen {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
 
-    pub fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>>{
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
+        let py = slf.py();
         if !slf.yielded {
             slf.yielded = true;
-            let py = slf.py();
-            return Ok(Some(slf.into_py_any(py).unwrap()));
+            let op = AcceptIo::from(slf.listener_arc.clone());
+            Some(op.into_py_any(py).unwrap())
         }
-        Err(PyStopIteration::new_err(slf.py().None()))
-    }
-}
 
-#[pyclass(unsendable)]
-pub struct WriteIo {
-    pub listener_arc: OptionArc<mio::net::TcpStream>,
-    pub data: Vec<u8>,
-    pub yielded: bool
-}
-
-#[pymethods]
-impl WriteIo {
-
-    #[new]
-    pub fn new(data: Vec<u8>) -> PyResult<Self> {
-        Ok(WriteIo {
-            listener_arc: None,
-            data,
-            yielded: false
-        })
-    }
-
-    pub fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    pub fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>>{
-        if !slf.yielded {
-            slf.yielded = true;
-            let py = slf.py();
-            return Ok(Some(slf.into_py_any(py).unwrap()));
+        else {
+            None
         }
-        Err(PyStopIteration::new_err(slf.py().None()))
     }
 }
-
-
 
 #[pyclass(unsendable)]
 pub struct PyTcpListener {
-    pub inner: OptionArc<mio::net::TcpListener>,
+    pub inner: Option<Arc<MioListener>>,
+    pub addr: String
 }
 
 #[pymethods]
 impl PyTcpListener {
-    #[new]
-    pub fn new() -> PyResult<Self> {
-        Ok(PyTcpListener { inner: None })
-    }
-
-    pub fn bind(&mut self, addr: &str) -> PyResult<()> {
-        let parsed_addr = addr.parse::<SocketAddr>()?;
-        let socket = Socket::new(Domain::for_address(parsed_addr), Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_nonblocking(true)?;
-        socket.bind(&parsed_addr.into())?;
-        socket.listen(1024)?;
-        let mio_sock = mio::net::TcpListener::from_std(socket.into());
-        self.inner = Some(Arc::new(Mutex::new(mio_sock)));
-        Ok(())
+    pub fn bind(slf: PyRef<'_, Self>, addr: &str) -> PyResult<BindIo> {
+        let parsed = addr.parse::<SocketAddr>()?;
+        Ok(
+            BindIo::new(parsed, slf.into())
+        )
     }
 
     pub fn accept(&self) -> PyResult<AcceptIo> {
         match &self.inner {
-            Some(arc) => Ok(
-                AcceptIo::from(arc.clone())
-            ),
-            None => {
-                Err(PyConnectionError::new_err("Socket not yet bound"))
-            }
+            Some(inner) => Ok(AcceptIo { listener_arc: inner.clone() }),
+            None => Err(PyConnectionError::new_err("Socket not yet bound"))
         }
+        
     }
+    
 }
 
-
-#[pyclass]
-pub struct PyTcpStream {
-    pub stream_arc: OptionArc<mio::net::TcpStream>
+#[pyclass(unsendable)]
+struct PyTcpStream {
+    pub inner: Option<Arc<MioStream>>,
+    pub addr: SocketAddr
 }
 
 #[pymethods]
 impl PyTcpStream {
-    #[new]
-    pub fn new() -> PyResult<Self> {
-        Ok(PyTcpStream { stream_arc: None})
-    }
-
-    pub fn connect(&self, addr: &str) -> PyResult<ConnectIo> {
-        let parsed = addr.parse::<SocketAddr>()?;
-        Ok(ConnectIo {addr: parsed, yielded: false})
-    }
-
-    pub fn read(&self, size: usize) -> PyResult<ReadIo> {
-        match &self.stream_arc {
-            Some(arc) => {
-                Ok(ReadIo {
-                    listener_arc: Some(arc.clone()),
-                    size,
-                    yielded: false
-                })
-            },
-            None => {
-                Err(PyConnectionError::new_err("Socket not yet connected"))
-            }
-        }
-    }
-
-    pub fn write(&self, data: Vec<u8>) -> PyResult<WriteIo> {
-        match &self.stream_arc {
-            Some(arc) => {
-                Ok(WriteIo {
-                    listener_arc: Some(arc.clone()),
-                    data,
-                    yielded: false
-                })
-            },
-            None => {
-                Err(PyConnectionError::new_err("Socket not yet connected"))
-            }
-        }
+    fn connect(&mut self) -> PyResult<ConnectIo>{
+        Ok(ConnectIo {addr: self.addr})
     }
 }

@@ -12,3 +12,4 @@ crate-type = ["cdylib"]
 mio = { version = "1.1.1", features = ["net", "os-poll", "os-ext"] }
 pyo3 = "0.25.0"
 socket2 = "0.6.2"
+tokio = { version = "1.49.0", features = ["full", "mio", "net", "socket2"] }
