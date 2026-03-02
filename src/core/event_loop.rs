@@ -1,7 +1,8 @@
 use std::{
     cell::RefCell,
-    collections::{BinaryHeap, HashMap, VecDeque},
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     iter,
+    net::SocketAddr,
     sync::{
         mpsc::{self, Receiver, Sender},
         Arc,
@@ -10,40 +11,22 @@ use std::{
 };
 
 use pyo3::{
-    exceptions::PyRuntimeError,
+    exceptions::{PyConnectionError, PyRuntimeError},
     prelude::*,
     types::{PyList, PyTuple},
+    IntoPyObjectExt,
 };
-use tokio::runtime::Runtime;
-
-use crate::{
-    core::future::{PyFuture, RustFuture},
-    core::task::{RustTask, StepResult, TaskId},
+use tokio::{
+    net::{TcpListener as TokioListener, TcpStream as TokioStream},
+    runtime::Runtime,
 };
 
-struct Timer {
-    when: Instant,
-    task_id: TaskId,
-}
-
-impl Eq for Timer {}
-impl PartialEq for Timer {
-    fn eq(&self, other: &Self) -> bool {
-        self.when == other.when
-    }
-}
-
-impl PartialOrd for Timer {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        other.when.partial_cmp(&self.when)
-    }
-}
-
-impl Ord for Timer {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.when.cmp(&self.when)
-    }
-}
+use crate::core::{
+    future::{PyFuture, RustFuture},
+    net::{BindIo, PyTcpListener},
+    task::{RustTask, StepResult, TaskId},
+    timers::Timer,
+};
 
 struct GatherState {
     total: usize,
@@ -93,7 +76,8 @@ struct EventLoop {
     future_type: Option<Py<PyAny>>,
     wake_rx: Receiver<(TaskId, Result<PyObject, PyErr>)>,
     wake_tx: Sender<(TaskId, Result<PyObject, PyErr>)>,
-    tokio_runtime: Runtime
+    pending_io: HashSet<TaskId>,
+    tokio_runtime: Runtime,
 }
 
 impl EventLoop {
@@ -125,7 +109,8 @@ impl EventLoop {
             future_type: Some(future_t),
             wake_rx: rx,
             wake_tx: tx,
-            tokio_runtime: Runtime::new().unwrap()
+            pending_io: HashSet::new(),
+            tokio_runtime: Runtime::new().unwrap(),
         })
     }
 
@@ -208,8 +193,46 @@ impl EventLoop {
         self.process_step(id, step_res, py)
     }
 
+    fn handle_bind(
+        &mut self,
+        id: TaskId,
+        addr: SocketAddr,
+        pyclass: Py<PyTcpListener>,
+    ) -> PyResult<()> {
+        let tx = self.wake_tx.clone();
+        self.tokio_runtime.spawn(async move {
+            let listener = TokioListener::bind(addr).await;
+            match listener {
+                Ok(socket) => {
+                    let result = Python::with_gil(|py| {
+                        let mut py_listener = pyclass.bind(py).borrow_mut();
+                        py_listener.set_listener(Arc::new(socket));
+
+                        (pyclass, addr.to_string()).into_py_any(py).unwrap()
+                    });
+
+                    let _ = tx.send((id, Ok(result)));
+                }
+                Err(e) => {
+                    let err = Python::with_gil(|_| {
+                        PyConnectionError::new_err(format!("Bind error: {}", e))
+                    });
+                    let _ = tx.send((id, Err(err)));
+                }
+            }
+        });
+        Ok(())
+    }
+
     fn handle_yield(&mut self, id: TaskId, val: Py<PyAny>, py: Python) -> PyResult<()> {
         let val_binded = val.bind(py);
+
+        if let Ok(bind) = val_binded.extract::<Py<BindIo>>() {
+            let binded = bind.bind(py).borrow_mut();
+
+            return self.handle_bind(id, binded.addr, binded.pyclass.clone_ref(py));
+        }
+
         if let Some(sleep_type) = &self.sleep_type {
             if val_binded.is_instance(sleep_type.bind(py))? {
                 let duration: f64 = val_binded.getattr("duration")?.extract()?;
@@ -333,6 +356,7 @@ impl EventLoop {
     fn run_forever(&mut self, py: Python) -> PyResult<()> {
         loop {
             while let Ok((id, res_result)) = self.wake_rx.try_recv() {
+                self.pending_io.remove(&id);
                 if let Some(entry) = self.tasks_hm.get_mut(&id) {
                     match res_result {
                         Ok(val) => entry.pending_val = Some(val),
