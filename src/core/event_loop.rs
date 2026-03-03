@@ -23,7 +23,7 @@ use tokio::{
 
 use crate::core::{
     future::{PyFuture, RustFuture},
-    net::{BindIo, PyTcpListener},
+    net::{AcceptIo, BindIo, ConnectIo, PyTcpListener, PyTcpStream},
     task::{RustTask, StepResult, TaskId},
     timers::Timer,
 };
@@ -224,6 +224,66 @@ impl EventLoop {
         Ok(())
     }
 
+    fn handle_accept(&mut self, id: TaskId, arc: Arc<TokioListener>) -> PyResult<()> {
+        let tx = self.wake_tx.clone();
+        self.tokio_runtime.spawn(async move {
+            let res = arc.accept().await;
+            match res {
+                Ok((stream, addr)) => {
+                    let result = Python::with_gil(|py| {
+                        let py_stream = PyTcpStream {
+                            inner: Arc::new(stream),
+                            addr,
+                        };
+                        let bound = py_stream.into_bound_py_any(py).unwrap();
+                        (bound, addr.to_string()).into_py_any(py).unwrap()
+                    });
+
+                    let _ = tx.send((id, Ok(result)));
+                }
+                Err(e) => {
+                    let err = Python::with_gil(|_| {
+                        PyConnectionError::new_err(format!("Accept error: {}", e))
+                    });
+
+                    let _ = tx.send((id, Err(err)));
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn handle_connect(&mut self, id: TaskId, connect_io: Py<ConnectIo>) -> PyResult<()> {
+        let tx = self.wake_tx.clone();
+
+        self.tokio_runtime.spawn(async move {
+            let (addr, pyclass) = Python::with_gil(|py| {
+                let connect = connect_io.bind(py).borrow();
+                (connect.addr, connect.pyclass.clone_ref(py))
+            });
+
+            match TokioStream::connect(addr).await {
+                Ok(stream) => {
+                    let result = Python::with_gil(|py| {
+                        let mut py_stream = pyclass.bind(py).borrow_mut();
+                        py_stream.set_stream(Arc::new(stream));
+                        py_stream.set_addr(addr);
+                        (pyclass, addr.to_string()).into_py_any(py).unwrap()
+                    });
+                    let _ = tx.send((id, Ok(result)));
+                }
+                Err(e) => {
+                    let err = Python::with_gil(|_| {
+                        PyConnectionError::new_err(format!("Failed to connect: {}", e))
+                    });
+                    let _ = tx.send((id, Err(err)));
+                }
+            }
+        });
+
+        Ok(())
+    }
+
     fn handle_yield(&mut self, id: TaskId, val: Py<PyAny>, py: Python) -> PyResult<()> {
         let val_binded = val.bind(py);
 
@@ -231,6 +291,15 @@ impl EventLoop {
             let binded = bind.bind(py).borrow_mut();
 
             return self.handle_bind(id, binded.addr, binded.pyclass.clone_ref(py));
+        }
+
+        if let Ok(accept) = val_binded.extract::<Py<AcceptIo>>() {
+            let bound = accept.bind(py).borrow_mut();
+            return self.handle_accept(id, bound.listener_arc.clone());
+        }
+
+        if let Ok(connect) = val_binded.extract::<Py<ConnectIo>>() {
+            return self.handle_connect(id, connect)
         }
 
         if let Some(sleep_type) = &self.sleep_type {

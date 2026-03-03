@@ -68,32 +68,38 @@ impl BindIoGen {
 #[pyclass]
 pub struct ConnectIo {
     pub addr: SocketAddr,
+    pub pyclass: Py<PyTcpStream>,
 }
 
 #[pymethods]
 impl ConnectIo {
     #[new]
-    pub fn new(addr: &str) -> PyResult<Self> {
+    pub fn new(addr: &str, parent: Py<PyTcpStream>) -> PyResult<Self> {
         let parsed = addr
             .parse::<SocketAddr>()
             .map_err(|e| PyOSError::new_err(format!("Invalid address: {}", e)))?;
 
-        Ok(ConnectIo { addr: parsed })
+        Ok(ConnectIo {
+            addr: parsed,
+            pyclass: parent,
+        })
     }
 
     fn __await__(slf: PyRef<'_, Self>) -> PyResult<Py<ConnectIoGen>> {
+        let py = slf.py();
+        let pyclass = slf.pyclass.clone_ref(py);
         let gen = ConnectIoGen {
-            addr: slf.addr,
+            parent: pyclass,
             yielded: false,
         };
 
-        Ok(Py::new(slf.py(), gen)?)
+        Ok(Py::new(py, gen)?)
     }
 }
 
 #[pyclass]
 struct ConnectIoGen {
-    addr: SocketAddr,
+    parent: Py<PyTcpStream>,
     yielded: bool,
 }
 
@@ -106,10 +112,11 @@ impl ConnectIoGen {
     fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
         if !slf.yielded {
             slf.yielded = true;
-            let op = ConnectIo {
-                addr: slf.addr.clone(),
-            };
             let py = slf.py();
+            let r = slf.parent.clone_ref(py);
+            let addr = r.borrow(py).addr.clone();
+            let op = ConnectIo { addr, pyclass: r };
+
             Some(op.into_py_any(py).unwrap())
         } else {
             None
@@ -195,14 +202,27 @@ impl PyTcpListener {
 }
 
 #[pyclass(unsendable)]
-struct PyTcpStream {
-    pub inner: Option<Arc<TokioStream>>,
+pub struct PyTcpStream {
+    pub inner: Arc<TokioStream>,
     pub addr: SocketAddr,
+}
+
+impl PyTcpStream {
+    pub fn set_stream(&mut self, arc: Arc<TokioStream>) {
+        self.inner = arc;
+    }
+
+    pub fn set_addr(&mut self, addr: SocketAddr) {
+        self.addr = addr;
+    }
 }
 
 #[pymethods]
 impl PyTcpStream {
-    fn connect(&mut self) -> PyResult<ConnectIo> {
-        Ok(ConnectIo { addr: self.addr })
+    fn connect(slf: PyRef<'_, Self>) -> PyResult<ConnectIo> {
+        Ok(ConnectIo {
+            addr: slf.addr,
+            pyclass: slf.into(),
+        })
     }
 }
