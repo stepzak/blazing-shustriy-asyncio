@@ -20,6 +20,9 @@ class EventLoop:
     def create_task(self, coro: t.Awaitable[t.Any]) -> _rc.PyFuture:
         """Creates task out ouf coroutine"""
         return self._impl.create_task(coro)
+    
+    def spawn(self, coro: t.Awaitable[t.Any]) -> None:
+        return self._impl.spawn(coro)
 
     def run_forever(self) -> None:
         """Runs event loop while it has tasks"""

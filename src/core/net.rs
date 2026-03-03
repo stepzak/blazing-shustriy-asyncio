@@ -75,14 +75,15 @@ pub struct ConnectIo {
 impl ConnectIo {
     #[new]
     pub fn new(addr: &str, py: Python) -> PyResult<Self> {
-        let parsed = addr.parse::<SocketAddr>()
+        let parsed = addr
+            .parse::<SocketAddr>()
             .map_err(|e| PyOSError::new_err(format!("Invalid address: {}", e)))?;
-        
+
         let py_stream = Py::new(py, PyTcpStream::empty())?;
-        
-        Ok(ConnectIo { 
-            addr: parsed, 
-            pyclass: py_stream 
+
+        Ok(ConnectIo {
+            addr: parsed,
+            pyclass: py_stream,
         })
     }
 
@@ -168,6 +169,116 @@ impl AcceptIoGen {
 }
 
 #[pyclass(unsendable)]
+pub struct ReadIo {
+    pub size: usize,
+    pub stream: Py<PyTcpStream>,
+}
+
+impl ReadIo {
+    pub fn new(size: usize, stream: Py<PyTcpStream>) -> Self {
+        ReadIo { size, stream }
+    }
+}
+
+#[pymethods]
+impl ReadIo {
+    fn __await__(slf: PyRef<'_, Self>) -> PyResult<Py<ReadIoGen>> {
+        let py = slf.py();
+        let gen = ReadIoGen {
+            read_io: slf.into(),
+            yielded: false,
+        };
+        Py::new(py, gen)
+    }
+}
+
+#[pyclass]
+struct ReadIoGen {
+    read_io: Py<ReadIo>,
+    yielded: bool,
+}
+
+#[pymethods]
+impl ReadIoGen {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
+        if !slf.yielded {
+            slf.yielded = true;
+            let py = slf.py();
+            Some(slf.read_io.clone_ref(py).into_py_any(py).unwrap())
+        } else {
+            None
+        }
+    }
+}
+
+#[pyclass(unsendable)]
+pub struct WriteIo {
+    pub data: Vec<u8>,
+    pub stream: Py<PyTcpStream>,
+    pub written: usize,
+    pub total: usize,
+}
+
+impl WriteIo {
+    pub fn new(data: Vec<u8>, stream: Py<PyTcpStream>) -> Self {
+        let total = data.len();
+        WriteIo {
+            data,
+            stream,
+            written: 0,
+            total,
+        }
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.total - self.written
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.written >= self.total
+    }
+}
+
+#[pymethods]
+impl WriteIo {
+    fn __await__(slf: PyRef<'_, Self>) -> PyResult<Py<WriteIoGen>> {
+        let py = slf.py();
+        let gen = WriteIoGen {
+            write_io: slf.into(),
+            yielded: false,
+        };
+        Py::new(py, gen)
+    }
+}
+
+#[pyclass]
+struct WriteIoGen {
+    write_io: Py<WriteIo>,
+    yielded: bool,
+}
+
+#[pymethods]
+impl WriteIoGen {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
+        if !slf.yielded {
+            slf.yielded = true;
+            let py = slf.py();
+            Some(slf.write_io.clone_ref(py).into_py_any(py).unwrap())
+        } else {
+            None
+        }
+    }
+}
+
+#[pyclass(unsendable)]
 pub struct PyTcpListener {
     pub inner: Option<Arc<TokioListener>>,
     pub addr: String,
@@ -181,6 +292,12 @@ impl PyTcpListener {
 
 #[pymethods]
 impl PyTcpListener {
+
+    #[new]
+    pub fn new() -> PyResult<Self> {
+        Ok(PyTcpListener {inner: None, addr: String::new()})
+    }
+
     pub fn bind(slf: PyRef<'_, Self>, addr: &str) -> PyResult<BindIo> {
         let parsed = addr.parse::<SocketAddr>()?;
         Ok(BindIo::new(parsed, slf.into()))
@@ -200,11 +317,16 @@ impl PyTcpListener {
 pub struct PyTcpStream {
     pub inner: Option<Arc<TokioStream>>,
     pub addr: Option<SocketAddr>,
+    pub closed: bool,
 }
 
 impl PyTcpStream {
     pub fn empty() -> Self {
-        PyTcpStream { inner: None, addr: None }
+        PyTcpStream {
+            inner: None,
+            addr: None,
+            closed: false,
+        }
     }
 
     pub fn set_stream(&mut self, arc: Arc<TokioStream>) {
@@ -218,6 +340,12 @@ impl PyTcpStream {
 
 #[pymethods]
 impl PyTcpStream {
+
+    #[new]
+    fn new() -> PyResult<Self> {
+        Ok(PyTcpStream::empty())
+    }
+
     #[staticmethod]
     fn connect(addr: String, py: Python) -> PyResult<ConnectIo> {
         ConnectIo::new(&addr, py)
@@ -232,5 +360,22 @@ impl PyTcpStream {
             Some(addr) => Ok(addr.to_string()),
             None => Err(PyOSError::new_err("Not connected")),
         }
+    }
+
+    fn read(slf: PyRef<'_, Self>, size: usize) -> PyResult<ReadIo> {
+        Ok(ReadIo {
+            size,
+            stream: slf.into(),
+        })
+    }
+
+    fn write(slf: PyRef<'_, Self>, data: Vec<u8>) -> PyResult<WriteIo> {
+        let l = data.len();
+        Ok(WriteIo {
+            data,
+            stream: slf.into(),
+            written: 0,
+            total: l,
+        })
     }
 }

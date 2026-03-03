@@ -8,6 +8,8 @@ mod sync;
 fn rust_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<core::future::PyFuture>()?;
     m.add_class::<core::event_loop::PyEventLoop>()?;
+    m.add_class::<core::net::PyTcpListener>()?;
+    m.add_class::<core::net::PyTcpStream>()?;
     let sync_mod = PyModule::new(m.py(), "sync")?;
     sync_mod.add_class::<sync::lock::PyLock>()?;
     sync_mod.add_class::<sync::semaphore::PySemaphore>()?;

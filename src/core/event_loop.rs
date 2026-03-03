@@ -1,3 +1,9 @@
+use pyo3::{
+    exceptions::{PyConnectionError, PyOSError, PyRuntimeError},
+    prelude::*,
+    types::{PyByteArray, PyList, PyTuple},
+    IntoPyObjectExt,
+};
 use std::{
     cell::RefCell,
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
@@ -9,13 +15,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
-use pyo3::{
-    exceptions::{PyConnectionError, PyRuntimeError},
-    prelude::*,
-    types::{PyList, PyTuple},
-    IntoPyObjectExt,
-};
 use tokio::{
     net::{TcpListener as TokioListener, TcpStream as TokioStream},
     runtime::Runtime,
@@ -23,7 +22,7 @@ use tokio::{
 
 use crate::core::{
     future::{PyFuture, RustFuture},
-    net::{AcceptIo, BindIo, ConnectIo, PyTcpListener, PyTcpStream},
+    net::{AcceptIo, BindIo, ConnectIo, PyTcpListener, PyTcpStream, ReadIo, WriteIo},
     task::{RustTask, StepResult, TaskId},
     timers::Timer,
 };
@@ -145,6 +144,13 @@ impl EventLoop {
         fut
     }
 
+    fn spawn(&mut self, gen: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
+        let id = self.next_id;
+        self.create_task(gen, py);
+        self.schedule_task(id);
+        Ok(())
+    }
+    
     fn schedule_task(&mut self, id: TaskId) {
         if self.tasks_hm.contains_key(&id) {
             self.task_deq.push_back(id);
@@ -200,6 +206,7 @@ impl EventLoop {
         pyclass: Py<PyTcpListener>,
     ) -> PyResult<()> {
         let tx = self.wake_tx.clone();
+        self.pending_io.insert(id);
         self.tokio_runtime.spawn(async move {
             let listener = TokioListener::bind(addr).await;
             match listener {
@@ -226,6 +233,7 @@ impl EventLoop {
 
     fn handle_accept(&mut self, id: TaskId, arc: Arc<TokioListener>) -> PyResult<()> {
         let tx = self.wake_tx.clone();
+        self.pending_io.insert(id);
         self.tokio_runtime.spawn(async move {
             let res = arc.accept().await;
             match res {
@@ -234,6 +242,7 @@ impl EventLoop {
                         let py_stream = PyTcpStream {
                             inner: Some(Arc::new(stream)),
                             addr: Some(addr),
+                            closed: false,
                         };
                         let bound = py_stream.into_bound_py_any(py).unwrap();
                         (bound, addr.to_string()).into_py_any(py).unwrap()
@@ -255,7 +264,7 @@ impl EventLoop {
 
     fn handle_connect(&mut self, id: TaskId, connect_io: Py<ConnectIo>) -> PyResult<()> {
         let tx = self.wake_tx.clone();
-
+        self.pending_io.insert(id);
         self.tokio_runtime.spawn(async move {
             let (addr, pyclass) = Python::with_gil(|py| {
                 let connect = connect_io.bind(py).borrow();
@@ -284,6 +293,128 @@ impl EventLoop {
         Ok(())
     }
 
+    fn handle_read(&mut self, id: TaskId, read_io: Py<ReadIo>) -> PyResult<()> {
+        let tx = self.wake_tx.clone();
+        self.pending_io.insert(id);
+        self.tokio_runtime.spawn(async move {
+            let (stream, size) = Python::with_gil(|py| {
+                let read = read_io.bind(py).borrow();
+                let stream = read.stream.bind(py).borrow();
+                (stream.inner.clone(), read.size)
+            });
+            let unwrapped = match stream {
+                Some(x) => x,
+                None => {
+                    let err = Python::with_gil(|_| PyOSError::new_err("Socket not yet bound"));
+                    let _ = tx.send((id, Err(err)));
+                    return;
+                }
+            };
+            match unwrapped.readable().await {
+                Ok(_) => {
+                    let mut buf = vec![0u8; size];
+                    match unwrapped.try_read(&mut buf) {
+                        Ok(0) => {
+                            let res = Python::with_gil(|py| py.None().into_py_any(py).unwrap());
+                            let _ = tx.send((id, Ok(res)));
+                        }
+                        Ok(n) => {
+                            buf.truncate(n);
+                            let res = Python::with_gil(|py| {
+                                PyByteArray::new(py, &buf).into_py_any(py).unwrap()
+                            });
+                            let _ = tx.send((id, Ok(res)));
+                        }
+                        Err(e) => {
+                            let err = Python::with_gil(|_| {
+                                PyConnectionError::new_err(format!("Read error: {}", e))
+                            });
+                            let _ = tx.send((id, Err(err)));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let err = Python::with_gil(|_| {
+                        PyConnectionError::new_err(format!("Read error: {}", e))
+                    });
+                    let _ = tx.send((id, Err(err)));
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn handle_write(&mut self, id: TaskId, write_io: Py<WriteIo>) -> PyResult<()> {
+        let tx = self.wake_tx.clone();
+        self.pending_io.insert(id);
+
+        self.tokio_runtime.spawn(async move {
+        let timeout = tokio::time::sleep(Duration::from_secs(30));
+        tokio::pin!(timeout);
+        let (stream, data, written) = Python::with_gil(|py| {
+            let write = write_io.bind(py).borrow();
+            let stream_ref = write.stream.bind(py).borrow();
+            (stream_ref.inner.clone(), write.data.clone(), write.written)
+        });
+
+        let stream = match stream {
+            Some(s) => s,
+            None => {
+                let _ = tx.send((id, Err(Python::with_gil(|_| {
+                    PyOSError::new_err("Socket not connected")
+                }))));
+                return;
+            }
+        };
+
+        tokio::select! {
+            _ = timeout => {
+                let err = Python::with_gil(|_| {
+                    PyConnectionError::new_err("Write timeout")
+                });
+                let _ = tx.send((id, Err(err)));
+            }
+            result = async {
+                let mut total_written = written;
+                let data_len = data.len();
+                while total_written < data_len {
+                    match stream.writable().await {
+                        Ok(()) => match stream.try_write(&data[total_written..]) {
+                            Ok(n) => {
+                                total_written += n;
+                                let _ = Python::with_gil(|py| {
+                                    if let Ok(mut write) = write_io.bind(py).try_borrow_mut() {
+                                        write.written = total_written;
+                                    }
+                                });
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                tokio::time::sleep(Duration::from_micros(100)).await;
+                                continue;
+                            }
+                            Err(e) => return Err(PyConnectionError::new_err(format!("Write error: {}", e))),
+                        },
+                        Err(e) => return Err(PyConnectionError::new_err(format!("Write error: {}", e))),
+                    }
+                }
+                Ok(total_written)
+            } => {
+                match result {
+                    Ok(n) => {
+                        let res = Python::with_gil(|py| n.into_py_any(py).unwrap());
+                        let _ = tx.send((id, Ok(res)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send((id, Err(e)));
+                    }
+                }
+            }
+        }
+    });
+
+        Ok(())
+    }
+
     fn handle_yield(&mut self, id: TaskId, val: Py<PyAny>, py: Python) -> PyResult<()> {
         let val_binded = val.bind(py);
 
@@ -299,7 +430,15 @@ impl EventLoop {
         }
 
         if let Ok(connect) = val_binded.extract::<Py<ConnectIo>>() {
-            return self.handle_connect(id, connect)
+            return self.handle_connect(id, connect);
+        }
+
+        if let Ok(read) = val_binded.extract::<Py<ReadIo>>() {
+            return self.handle_read(id, read);
+        }
+
+        if let Ok(write) = val_binded.extract::<Py<WriteIo>>() {
+            return self.handle_write(id, write);
         }
 
         if let Some(sleep_type) = &self.sleep_type {
@@ -448,9 +587,20 @@ impl EventLoop {
                     continue;
                 } else {
                     let duration = next_timer.when.duration_since(now);
-                    py.allow_threads(|| std::thread::sleep(duration));
+
+                    if !self.pending_io.is_empty() {
+                        let sleep_duration = std::cmp::min(duration, Duration::from_millis(10));
+                        py.allow_threads(|| std::thread::sleep(sleep_duration));
+                    } else {
+                        py.allow_threads(|| std::thread::sleep(duration));
+                    }
                     continue;
                 }
+            }
+
+            if !self.pending_io.is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
             }
 
             if self.tasks_hm.is_empty() {
@@ -458,6 +608,7 @@ impl EventLoop {
             }
             py.check_signals()?;
         }
+        self.shutdown();
         Ok(())
     }
 
@@ -467,6 +618,16 @@ impl EventLoop {
         self.schedule_task(id);
         self.run_forever(py)
     }
+
+    fn shutdown(&mut self) {
+        for id in self.pending_io.drain() {
+            if let Some(entry) = self.tasks_hm.get_mut(&id) {
+                entry.pending_err = Some(PyRuntimeError::new_err("Event loop shutting down"));
+                self.task_deq.push_back(id);
+            }
+        }
+    }
+    
 }
 
 pub struct RustEventLoop {
@@ -480,6 +641,9 @@ impl RustEventLoop {
     }
     pub fn create_task(&self, gen: &Bound<'_, PyAny>, py: Python) -> RustFuture {
         self.event_loop.borrow_mut().create_task(gen, py)
+    }
+    pub fn spawn(&self, gen: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
+        self.event_loop.borrow_mut().spawn(gen, py)
     }
     pub fn run_forever(&self, py: Python) -> PyResult<()> {
         self.event_loop.borrow_mut().run_forever(py)
@@ -505,6 +669,12 @@ impl PyEventLoop {
         let py = slf.py();
         let fut = slf.borrow().loop_impl.create_task(gen, py);
         Ok(Py::new(py, PyFuture { future: fut })?.into_any())
+    }
+
+    fn spawn(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<()> {
+        let py = slf.py();
+        let _ = slf.borrow().loop_impl.spawn(gen, py);
+        Ok(())
     }
 
     fn run_forever(&self, py: Python) -> PyResult<()> {
