@@ -232,8 +232,8 @@ impl EventLoop {
                 Ok((stream, addr)) => {
                     let result = Python::with_gil(|py| {
                         let py_stream = PyTcpStream {
-                            inner: Arc::new(stream),
-                            addr,
+                            inner: Some(Arc::new(stream)),
+                            addr: Some(addr),
                         };
                         let bound = py_stream.into_bound_py_any(py).unwrap();
                         (bound, addr.to_string()).into_py_any(py).unwrap()
@@ -268,7 +268,7 @@ impl EventLoop {
                         let mut py_stream = pyclass.bind(py).borrow_mut();
                         py_stream.set_stream(Arc::new(stream));
                         py_stream.set_addr(addr);
-                        (pyclass, addr.to_string()).into_py_any(py).unwrap()
+                        pyclass.into_py_any(py).unwrap()
                     });
                     let _ = tx.send((id, Ok(result)));
                 }

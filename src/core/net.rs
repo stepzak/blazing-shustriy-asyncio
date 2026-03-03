@@ -74,32 +74,31 @@ pub struct ConnectIo {
 #[pymethods]
 impl ConnectIo {
     #[new]
-    pub fn new(addr: &str, parent: Py<PyTcpStream>) -> PyResult<Self> {
-        let parsed = addr
-            .parse::<SocketAddr>()
+    pub fn new(addr: &str, py: Python) -> PyResult<Self> {
+        let parsed = addr.parse::<SocketAddr>()
             .map_err(|e| PyOSError::new_err(format!("Invalid address: {}", e)))?;
-
-        Ok(ConnectIo {
-            addr: parsed,
-            pyclass: parent,
+        
+        let py_stream = Py::new(py, PyTcpStream::empty())?;
+        
+        Ok(ConnectIo { 
+            addr: parsed, 
+            pyclass: py_stream 
         })
     }
 
     fn __await__(slf: PyRef<'_, Self>) -> PyResult<Py<ConnectIoGen>> {
         let py = slf.py();
-        let pyclass = slf.pyclass.clone_ref(py);
         let gen = ConnectIoGen {
-            parent: pyclass,
+            connect_io: slf.into(),
             yielded: false,
         };
-
         Ok(Py::new(py, gen)?)
     }
 }
 
 #[pyclass]
 struct ConnectIoGen {
-    parent: Py<PyTcpStream>,
+    connect_io: Py<ConnectIo>,
     yielded: bool,
 }
 
@@ -113,11 +112,7 @@ impl ConnectIoGen {
         if !slf.yielded {
             slf.yielded = true;
             let py = slf.py();
-            let r = slf.parent.clone_ref(py);
-            let addr = r.borrow(py).addr.clone();
-            let op = ConnectIo { addr, pyclass: r };
-
-            Some(op.into_py_any(py).unwrap())
+            Some(slf.connect_io.clone_ref(py).into_py_any(py).unwrap())
         } else {
             None
         }
@@ -203,26 +198,39 @@ impl PyTcpListener {
 
 #[pyclass(unsendable)]
 pub struct PyTcpStream {
-    pub inner: Arc<TokioStream>,
-    pub addr: SocketAddr,
+    pub inner: Option<Arc<TokioStream>>,
+    pub addr: Option<SocketAddr>,
 }
 
 impl PyTcpStream {
+    pub fn empty() -> Self {
+        PyTcpStream { inner: None, addr: None }
+    }
+
     pub fn set_stream(&mut self, arc: Arc<TokioStream>) {
-        self.inner = arc;
+        self.inner = Some(arc);
     }
 
     pub fn set_addr(&mut self, addr: SocketAddr) {
-        self.addr = addr;
+        self.addr = Some(addr);
     }
 }
 
 #[pymethods]
 impl PyTcpStream {
-    fn connect(slf: PyRef<'_, Self>) -> PyResult<ConnectIo> {
-        Ok(ConnectIo {
-            addr: slf.addr,
-            pyclass: slf.into(),
-        })
+    #[staticmethod]
+    fn connect(addr: String, py: Python) -> PyResult<ConnectIo> {
+        ConnectIo::new(&addr, py)
+    }
+
+    fn is_connected(&self) -> PyResult<bool> {
+        Ok(self.addr.is_some())
+    }
+
+    fn peer_addr(&self) -> PyResult<String> {
+        match self.addr {
+            Some(addr) => Ok(addr.to_string()),
+            None => Err(PyOSError::new_err("Not connected")),
+        }
     }
 }
