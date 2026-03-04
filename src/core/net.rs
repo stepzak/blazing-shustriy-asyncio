@@ -3,8 +3,7 @@ use pyo3::{
     prelude::*,
     IntoPyObjectExt,
 };
-use std::{net::SocketAddr, sync::Arc};
-use tokio::net::{TcpListener as TokioListener, TcpStream as TokioStream};
+use std::net::SocketAddr;
 
 macro_rules! impl_generator {
     ($name:ident, $field:ident, $type:ty) => {
@@ -28,13 +27,11 @@ macro_rules! impl_generator {
                 mut slf: PyRefMut<'_, Self>,
                 _value: Option<PyObject>,
             ) -> PyResult<Option<PyObject>> {
-                println!("Send");
                 if !slf.yielded {
                     slf.yielded = true;
                     let py = slf.py();
                     Ok(Some(slf.$field.clone_ref(py).into_py_any(py)?))
                 } else {
-                    println!("Stopped iteration");
                     Err(PyStopIteration::new_err(()))
                 }
             }
@@ -169,14 +166,12 @@ impl_generator!(ConnectIoGen, connect_io, ConnectIo);
 
 #[pyclass(unsendable)]
 pub struct AcceptIo {
-    pub listener_arc: Arc<TokioListener>,
+    pub listener_id: usize,
 }
 
-impl From<Arc<TokioListener>> for AcceptIo {
-    fn from(value: Arc<TokioListener>) -> Self {
-        AcceptIo {
-            listener_arc: value,
-        }
+impl AcceptIo {
+    pub fn new(listener_id: usize) -> Self {
+        AcceptIo { listener_id }
     }
 }
 
@@ -184,7 +179,7 @@ impl From<Arc<TokioListener>> for AcceptIo {
 impl AcceptIo {
     fn __await__(slf: PyRef<'_, Self>) -> PyResult<Py<AcceptIoGen>> {
         let gen = AcceptIoGen {
-            listener_arc: slf.listener_arc.clone(),
+            listener_id: slf.listener_id,
             yielded: false,
         };
         Py::new(slf.py(), gen)
@@ -193,21 +188,57 @@ impl AcceptIo {
 
 #[pyclass(unsendable)]
 struct AcceptIoGen {
-    listener_arc: Arc<TokioListener>,
+    listener_id: usize,
     yielded: bool,
 }
 
-impl_generator!(AcceptIoGen, listener_arc, AcceptIo, arc);
+#[pymethods]
+impl AcceptIoGen {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>> {
+        if !slf.yielded {
+            slf.yielded = true;
+            let py = slf.py();
+            let op = AcceptIo {
+                listener_id: slf.listener_id,
+            };
+            Ok(Some(op.into_py_any(py)?))
+        } else {
+            Err(PyStopIteration::new_err(()))
+        }
+    }
+
+    fn send(mut slf: PyRefMut<'_, Self>, _value: Option<PyObject>) -> PyResult<Option<PyObject>> {
+        if !slf.yielded {
+            slf.yielded = true;
+            let py = slf.py();
+            let op = AcceptIo {
+                listener_id: slf.listener_id,
+            };
+            Ok(Some(op.into_py_any(py)?))
+        } else {
+            Err(PyStopIteration::new_err(()))
+        }
+    }
+
+    fn throw(_slf: PyRefMut<'_, Self>, exc: Bound<'_, PyAny>) -> PyResult<Option<PyObject>> {
+        let py_err = PyErr::from_value(exc);
+        Err(py_err)
+    }
+}
 
 #[pyclass(unsendable)]
 pub struct ReadIo {
     pub size: usize,
-    pub stream: Py<PyTcpStream>,
+    pub stream_id: usize,
 }
 
 impl ReadIo {
-    pub fn new(size: usize, stream: Py<PyTcpStream>) -> Self {
-        ReadIo { size, stream }
+    pub fn new(size: usize, stream_id: usize) -> Self {
+        ReadIo { size, stream_id }
     }
 }
 
@@ -234,17 +265,17 @@ impl_generator!(ReadIoGen, read_io, ReadIo);
 #[pyclass(unsendable)]
 pub struct WriteIo {
     pub data: Vec<u8>,
-    pub stream: Py<PyTcpStream>,
+    pub stream_id: usize,
     pub written: usize,
     pub total: usize,
 }
 
 impl WriteIo {
-    pub fn new(data: Vec<u8>, stream: Py<PyTcpStream>) -> Self {
+    pub fn new(data: Vec<u8>, stream_id: usize) -> Self {
         let total = data.len();
         WriteIo {
             data,
-            stream,
+            stream_id,
             written: 0,
             total,
         }
@@ -281,13 +312,13 @@ impl_generator!(WriteIoGen, write_io, WriteIo);
 
 #[pyclass(unsendable)]
 pub struct PyTcpListener {
-    pub inner: Option<Arc<TokioListener>>,
     pub addr: String,
+    pub listener_id: Option<usize>,
 }
 
 impl PyTcpListener {
-    pub fn set_listener(&mut self, arc: Arc<TokioListener>) {
-        self.inner = Some(arc);
+    pub fn set_listener_id(&mut self, id: usize) {
+        self.listener_id = Some(id);
     }
 }
 
@@ -296,8 +327,8 @@ impl PyTcpListener {
     #[new]
     pub fn new() -> PyResult<Self> {
         Ok(PyTcpListener {
-            inner: None,
             addr: String::new(),
+            listener_id: None,
         })
     }
 
@@ -307,10 +338,8 @@ impl PyTcpListener {
     }
 
     pub fn accept(&self) -> PyResult<AcceptIo> {
-        match &self.inner {
-            Some(inner) => Ok(AcceptIo {
-                listener_arc: inner.clone(),
-            }),
+        match self.listener_id {
+            Some(id) => Ok(AcceptIo { listener_id: id }),
             None => Err(PyConnectionError::new_err("Socket not yet bound")),
         }
     }
@@ -318,7 +347,7 @@ impl PyTcpListener {
 
 #[pyclass(unsendable)]
 pub struct PyTcpStream {
-    pub inner: Option<Arc<TokioStream>>,
+    pub stream_id: Option<usize>,
     pub addr: Option<SocketAddr>,
     pub closed: bool,
 }
@@ -326,14 +355,14 @@ pub struct PyTcpStream {
 impl PyTcpStream {
     pub fn empty() -> Self {
         PyTcpStream {
-            inner: None,
+            stream_id: None,
             addr: None,
             closed: false,
         }
     }
 
-    pub fn set_stream(&mut self, arc: Arc<TokioStream>) {
-        self.inner = Some(arc);
+    pub fn set_stream_id(&mut self, id: usize) {
+        self.stream_id = Some(id);
     }
 
     pub fn set_addr(&mut self, addr: SocketAddr) {
@@ -365,19 +394,24 @@ impl PyTcpStream {
     }
 
     fn read(slf: PyRef<'_, Self>, size: usize) -> PyResult<ReadIo> {
-        Ok(ReadIo {
-            size,
-            stream: slf.into(),
-        })
+        match slf.stream_id {
+            Some(stream_id) => Ok(ReadIo { size, stream_id }),
+            None => Err(PyOSError::new_err("Not connected")),
+        }
     }
 
     fn write(slf: PyRef<'_, Self>, data: Vec<u8>) -> PyResult<WriteIo> {
-        let l = data.len();
-        Ok(WriteIo {
-            data,
-            stream: slf.into(),
-            written: 0,
-            total: l,
-        })
+        match slf.stream_id {
+            Some(stream_id) => {
+                let l = data.len();
+                Ok(WriteIo {
+                    data,
+                    stream_id,
+                    written: 0,
+                    total: l,
+                })
+            }
+            None => Err(PyOSError::new_err("Not connected")),
+        }
     }
 }
