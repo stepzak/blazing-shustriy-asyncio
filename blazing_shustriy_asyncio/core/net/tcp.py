@@ -7,15 +7,15 @@ class TcpListener:
         self._impl = PyTcpListener()
     
     async def bind(self, addr: str):
-        result = await self._impl.bind(addr)
+        await self._impl.bind(addr)
         return self
     
     async def accept(self):
-        stream_impl, addr = await self._impl.accept()
-        
+        stream_impl = await self._impl.accept()
+        print(stream_impl)
         stream = TcpStream()
         stream._impl = stream_impl
-        return stream, addr
+        return stream
 
 class TcpStream:
     __slots__ = ("_impl",)

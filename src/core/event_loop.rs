@@ -1,7 +1,7 @@
+use crossbeam_channel::{self as cb, Receiver, Sender, select};
 use pyo3::{
     exceptions::{PyConnectionError, PyRuntimeError},
     prelude::*,
-    pyclass,
     types::{PyByteArray, PyList, PyTuple},
     IntoPyObjectExt,
 };
@@ -10,10 +10,7 @@ use std::{
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     iter,
     net::SocketAddr,
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -39,7 +36,6 @@ enum IoResult {
         stream: Arc<TokioStream>,
         addr: SocketAddr,
     },
-
     Connect {
         stream_id: usize,
         stream: Arc<TokioStream>,
@@ -52,6 +48,11 @@ enum IoResult {
         n: usize,
     },
     Error(PyErr),
+}
+
+enum Command {
+    Spawn(Py<PyAny>),
+    Stop,
 }
 
 struct GatherState {
@@ -106,6 +107,7 @@ struct EventLoop {
     tokio_runtime: Runtime,
     io_rx: Receiver<(usize, IoResult)>,
     io_tx: Sender<(usize, IoResult)>,
+    cmd_rx: Receiver<Command>,
     pending_listeners: HashMap<usize, Py<PyTcpListener>>,
     listeners: HashMap<usize, (Arc<TokioListener>, SocketAddr, Py<PyTcpListener>)>,
     next_listener_id: usize,
@@ -115,7 +117,14 @@ struct EventLoop {
 }
 
 impl EventLoop {
-    fn new(py: Python) -> PyResult<Self> {
+    fn new(
+        py: Python,
+        wake_rx: Receiver<(TaskId, Result<PyObject, PyErr>)>,
+        wake_tx: Sender<(TaskId, Result<PyObject, PyErr>)>,
+        io_rx: Receiver<(usize, IoResult)>,
+        io_tx: Sender<(usize, IoResult)>,
+        cmd_rx: Receiver<Command>,
+    ) -> PyResult<Self> {
         let module = PyModule::import(py, "blazing_shustriy_asyncio")?;
         let sleep_t = module.getattr("_AsyncSleep")?.unbind();
         let gather_t = module.getattr("_AsyncGather")?.unbind();
@@ -131,9 +140,6 @@ impl EventLoop {
             .unwrap()
             .unbind();
 
-        let (tx, rx) = mpsc::channel();
-        let (io_tx, io_rx) = mpsc::channel();
-
         Ok(EventLoop {
             tasks_hm: HashMap::new(),
             task_deq: VecDeque::new(),
@@ -142,12 +148,13 @@ impl EventLoop {
             sleep_type: Some(sleep_t),
             gather_type: Some(gather_t),
             future_type: Some(future_t),
-            wake_rx: rx,
-            wake_tx: tx,
+            wake_rx,
+            wake_tx,
             pending_io: HashSet::new(),
             tokio_runtime: Runtime::new().unwrap(),
-            io_tx,
             io_rx,
+            io_tx,
+            cmd_rx,
             pending_listeners: HashMap::new(),
             listeners: HashMap::new(),
             streams: HashMap::new(),
@@ -186,13 +193,6 @@ impl EventLoop {
         );
 
         fut
-    }
-
-    fn spawn(&mut self, gen: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
-        let id = self.next_id;
-        self.create_task(gen, py);
-        self.schedule_task(id);
-        Ok(())
     }
 
     fn schedule_task(&mut self, id: TaskId) {
@@ -279,7 +279,6 @@ impl EventLoop {
     fn handle_accept(&mut self, id: TaskId, listener_id: usize) -> PyResult<()> {
         let tx = self.io_tx.clone();
         self.pending_io.insert(id);
-
         let stream_id = self.next_stream_id;
         self.next_stream_id += 1;
 
@@ -301,7 +300,6 @@ impl EventLoop {
                     }
                     Err(e) => {
                         let err = PyConnectionError::new_err(format!("Accept error: {}", e));
-
                         let _ = tx.send((id, IoResult::Error(err)));
                     }
                 }
@@ -323,10 +321,8 @@ impl EventLoop {
     ) -> PyResult<()> {
         let tx = self.io_tx.clone();
         self.pending_io.insert(id);
-
         let stream_id = self.next_stream_id;
         self.next_stream_id += 1;
-
         self.pending_streams.insert(stream_id, py_stream);
 
         self.tokio_runtime.spawn(async move {
@@ -363,11 +359,21 @@ impl EventLoop {
                         let mut buf = vec![0u8; size];
                         match stream.try_read(&mut buf) {
                             Ok(0) => {
-                                let _ = tx.send((id, IoResult::Read { data: None }));
+                                let _ = tx.send((
+                                    id,
+                                    IoResult::Read {
+                                        data: None,
+                                    },
+                                ));
                             }
                             Ok(n) => {
                                 buf.truncate(n);
-                                let _ = tx.send((id, IoResult::Read { data: Some(buf) }));
+                                let _ = tx.send((
+                                    id,
+                                    IoResult::Read {
+                                        data: Some(buf),
+                                    },
+                                ));
                             }
                             Err(e) => {
                                 let err = PyConnectionError::new_err(format!("Read error: {}", e));
@@ -393,49 +399,50 @@ impl EventLoop {
     fn handle_write(&mut self, id: TaskId, stream_id: usize, data: Vec<u8>) -> PyResult<()> {
         let tx = self.io_tx.clone();
         self.pending_io.insert(id);
+        
         if let Some((stream_orig, _, _)) = self.streams.get(&stream_id) {
             let stream = stream_orig.clone();
+            let data_len = data.len();
+            
             self.tokio_runtime.spawn(async move {
-            let timeout = tokio::time::sleep(Duration::from_secs(30));
-            tokio::pin!(timeout);
+                let timeout = tokio::time::sleep(Duration::from_secs(30));
+                tokio::pin!(timeout);
 
-            tokio::select! {
-            _ = timeout => {
-                let err = PyConnectionError::new_err("Write timeout");
-
-                let _ = tx.send((id, IoResult::Error(err)));
-            }
-            result = async {
-                let mut total_written = 0;
-                let data_len = data.len();
-                while total_written < data_len {
-                    match stream.writable().await {
-                        Ok(()) => match stream.try_write(&data[total_written..]) {
+                tokio::select! {
+                    _ = timeout => {
+                        let err = PyConnectionError::new_err("Write timeout");
+                        let _ = tx.send((id, IoResult::Error(err)));
+                    }
+                    result = async {
+                        let mut total_written = 0;
+                        while total_written < data_len {
+                            match stream.writable().await {
+                                Ok(()) => match stream.try_write(&data[total_written..]) {
+                                    Ok(n) => {
+                                        total_written += n;
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                        tokio::time::sleep(Duration::from_micros(100)).await;
+                                        continue;
+                                    }
+                                    Err(e) => return Err(PyConnectionError::new_err(format!("Write error: {}", e))),
+                                },
+                                Err(e) => return Err(PyConnectionError::new_err(format!("Write error: {}", e))),
+                            }
+                        }
+                        Ok(total_written)
+                    } => {
+                        match result {
                             Ok(n) => {
-                                total_written += n;
+                                let _ = tx.send((id, IoResult::Write { n }));
                             }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                tokio::time::sleep(Duration::from_micros(100)).await;
-                                continue;
+                            Err(e) => {
+                                let _ = tx.send((id, IoResult::Error(e)));
                             }
-                            Err(e) => return Err(PyConnectionError::new_err(format!("Write error: {}", e))),
-                        },
-                        Err(e) => return Err(PyConnectionError::new_err(format!("Write error: {}", e))),
+                        }
                     }
                 }
-                Ok(total_written)
-            } => {
-                match result {
-                    Ok(n) => {
-                        let _ = tx.send((id, IoResult::Write { n }));
-                    }
-                    Err(e) => {
-                        let _ = tx.send((id, IoResult::Error(e)));
-                    }
-                }
-            }
-        }
-    });
+            });
         } else {
             let err = PyRuntimeError::new_err("Stream not found");
             self.pending_io.remove(&id);
@@ -450,7 +457,6 @@ impl EventLoop {
 
         if let Ok(bind) = val_binded.extract::<Py<BindIo>>() {
             let binded = bind.bind(py).borrow_mut();
-
             return self.handle_bind(id, binded.addr, binded.pyclass.clone_ref(py));
         }
 
@@ -528,7 +534,7 @@ impl EventLoop {
             let child_id = self.next_id - 1;
             self.schedule_task(child_id);
 
-            let tx_clone: Sender<(usize, Result<Py<PyAny>, PyErr>)> = self.wake_tx.clone();
+            let tx_clone = self.wake_tx.clone();
             let my_id = id;
 
             child_future.add_callback(
@@ -600,137 +606,171 @@ impl EventLoop {
         }
         Ok(())
     }
-    fn run_forever(&mut self, py: Python) -> PyResult<()> {
-        loop {
-            while let Ok((id, res_result)) = self.wake_rx.try_recv() {
-                self.pending_io.remove(&id);
-                if let Some(entry) = self.tasks_hm.get_mut(&id) {
-                    match res_result {
-                        Ok(val) => entry.pending_val = Some(val),
-                        Err(err) => entry.pending_err = Some(err),
+
+    fn handle_wake(
+        &mut self,
+        id: TaskId,
+        res_result: Result<PyObject, PyErr>,
+    ) -> PyResult<()> {
+        self.pending_io.remove(&id);
+        if let Some(entry) = self.tasks_hm.get_mut(&id) {
+            match res_result {
+                Ok(val) => entry.pending_val = Some(val),
+                Err(err) => entry.pending_err = Some(err),
+            }
+            self.task_deq.push_back(id);
+        }
+        Ok(())
+    }
+
+    fn handle_io(&mut self, id: TaskId, result: IoResult, py: Python) -> PyResult<()> {
+        match result {
+            IoResult::Bind {
+                listener_id,
+                listener,
+                addr,
+            } => {
+                if let Some(pyclass) = self.pending_listeners.remove(&listener_id) {
+                    if let Ok(mut py_listener) = pyclass.bind(py).try_borrow_mut() {
+                        py_listener.set_listener_id(listener_id);
                     }
+                    self.listeners
+                        .insert(listener_id, (listener, addr, pyclass.clone_ref(py)));
+                    if let Some(entry) = self.tasks_hm.get_mut(&id) {
+                        entry.pending_val =
+                            Some((pyclass, addr.to_string()).into_py_any(py).unwrap());
+                        self.task_deq.push_back(id);
+                    }
+                }
+            }
+            IoResult::Accept {
+                stream_id,
+                stream,
+                addr,
+            } => {
+                let res = PyTcpStream {
+                    stream_id: Some(stream_id),
+                    addr: Some(addr),
+                    closed: false,
+                };
+                let obj = Py::new(py, res)?;
+                self.streams
+                    .insert(stream_id, (stream, addr, obj.clone_ref(py)));
+
+                if let Some(entry) = self.tasks_hm.get_mut(&id) {
+                    let result = (obj, addr.to_string()).into_py_any(py).unwrap();
+                    entry.pending_val = Some(result);
                     self.task_deq.push_back(id);
                 }
             }
-
-            while let Ok((id, result)) = self.io_rx.try_recv() {
-                match result {
-                    IoResult::Bind {
-                        listener_id,
-                        listener,
-                        addr,
-                    } => {
-                        if let Some(pyclass) = self.pending_listeners.remove(&listener_id) {
-                            if let Ok(mut py_listener) = pyclass.bind(py).try_borrow_mut() {
-                                py_listener.set_listener_id(listener_id);
-                            }
-                            self.listeners
-                                .insert(listener_id, (listener, addr, pyclass.clone_ref(py)));
-                            if let Some(entry) = self.tasks_hm.get_mut(&id) {
-                                entry.pending_val =
-                                    Some((pyclass, addr.to_string()).into_py_any(py).unwrap());
-                                self.task_deq.push_back(id);
-                            }
-                        }
+            IoResult::Connect {
+                stream_id,
+                stream,
+                addr,
+            } => {
+                if let Some(pyclass) = self.pending_streams.remove(&stream_id) {
+                    if let Ok(mut pyref) = pyclass.bind(py).try_borrow_mut() {
+                        pyref.set_addr(addr);
+                        pyref.set_stream_id(stream_id);
                     }
-                    IoResult::Accept {
-                        stream_id,
-                        stream,
-                        addr,
-                    } => {
-                        let res = PyTcpStream {
-                            stream_id: Some(stream_id),
-                            addr: Some(addr),
-                            closed: false,
-                        };
-                        let obj = Py::new(py, res)?;
-                        self.streams
-                            .insert(stream_id, (stream, addr, obj.clone_ref(py)));
-
-                        if let Some(entry) = self.tasks_hm.get_mut(&id) {
-                            entry.pending_val = Some(obj.into_py_any(py).unwrap());
-                            self.task_deq.push_back(id);
-                        }
-                    }
-                    IoResult::Connect {
-                        stream_id,
-                        stream,
-                        addr,
-                    } => {
-                        if let Some(pyclass) = self.pending_streams.remove(&stream_id) {
-                            if let Ok(mut pyref) = pyclass.bind(py).try_borrow_mut() {
-                                pyref.set_addr(addr);
-                                pyref.set_stream_id(stream_id);
-                            }
-                            self.streams
-                                .insert(stream_id, (stream, addr, pyclass.clone_ref(py)));
-                            if let Some(entry) = self.tasks_hm.get_mut(&id) {
-                                entry.pending_val =
-                                    Some((pyclass, addr.to_string()).into_py_any(py).unwrap());
-                                self.task_deq.push_back(id);
-                            }
-                        }
-                    }
-                    IoResult::Read { data } => {
-                        let result = data
-                            .map(|buf| PyByteArray::new(py, &buf).into_py_any(py).unwrap())
-                            .unwrap_or_else(|| py.None().into_py_any(py).unwrap());
-
-                        if let Some(entry) = self.tasks_hm.get_mut(&id) {
-                            entry.pending_val = Some(result);
-                            self.task_deq.push_back(id);
-                        }
-                    }
-                    IoResult::Write { n } => {
-                        let result = n.into_py_any(py).unwrap();
-                        if let Some(entry) = self.tasks_hm.get_mut(&id) {
-                            entry.pending_val = Some(result);
-                            self.task_deq.push_back(id);
-                        }
-                    }
-                    IoResult::Error(err) => {
-                        if let Some(entry) = self.tasks_hm.get_mut(&id) {
-                            entry.pending_err = Some(err);
-                            self.task_deq.push_back(id);
-                        }
+                    self.streams
+                        .insert(stream_id, (stream, addr, pyclass.clone_ref(py)));
+                    if let Some(entry) = self.tasks_hm.get_mut(&id) {
+                        entry.pending_val =
+                            Some((pyclass, addr.to_string()).into_py_any(py).unwrap());
+                        self.task_deq.push_back(id);
                     }
                 }
             }
+            IoResult::Read { data } => {
+                let result = data
+                    .map(|buf| PyByteArray::new(py, &buf).into_py_any(py).unwrap())
+                    .unwrap_or_else(|| py.None().into_py_any(py).unwrap());
 
-            if let Some(id) = self.task_deq.pop_front() {
+                if let Some(entry) = self.tasks_hm.get_mut(&id) {
+                    entry.pending_val = Some(result);
+                    self.task_deq.push_back(id);
+                }
+            }
+            IoResult::Write { n } => {
+                let result = n.into_py_any(py).unwrap();
+                if let Some(entry) = self.tasks_hm.get_mut(&id) {
+                    entry.pending_val = Some(result);
+                    self.task_deq.push_back(id);
+                }
+            }
+            IoResult::Error(err) => {
+                if let Some(entry) = self.tasks_hm.get_mut(&id) {
+                    entry.pending_err = Some(err);
+                    self.task_deq.push_back(id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_command(&mut self, cmd: Command, py: Python) -> PyResult<()> {
+        match cmd {
+            Command::Spawn(gen) => {
+                let gen_bound = gen.bind(py);
+                self.create_task(gen_bound, py);
+                let id = self.next_id - 1;
+                self.schedule_task(id);
+            }
+            Command::Stop => {
+                self.shutdown();
+            }
+        }
+        Ok(())
+    }
+
+    fn check_timers(&mut self) -> PyResult<()> {
+        if let Some(next_timer) = self.timers.peek() {
+            let now = Instant::now();
+            if next_timer.when <= now {
+                let timer = self.timers.pop().unwrap();
+                self.task_deq.push_back(timer.task_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn run_forever(&mut self, py: Python) -> PyResult<()> {
+        loop {
+            select! {
+                recv(self.wake_rx) -> msg => {
+                    if let Ok((id, res_result)) = msg {
+                        self.handle_wake(id, res_result)?;
+                    }
+                }
+                recv(self.io_rx) -> msg => {
+                    if let Ok((id, result)) = msg {
+                        self.handle_io(id, result, py)?;
+                    }
+                }
+                recv(self.cmd_rx) -> msg => {
+                    if let Ok(cmd) = msg {
+                        self.handle_command(cmd, py)?;
+                    }
+                }
+                default(Duration::from_millis(10)) => {
+                    self.check_timers()?;
+                }
+            }
+
+            while let Some(id) = self.task_deq.pop_front() {
                 self.run_task(py, id)?;
-                continue;
             }
 
-            if let Some(next_timer) = self.timers.peek() {
-                let now = Instant::now();
-                if next_timer.when <= now {
-                    let timer = self.timers.pop().unwrap();
-                    self.task_deq.push_back(timer.task_id);
-                    continue;
-                } else {
-                    let duration = next_timer.when.duration_since(now);
-
-                    if !self.pending_io.is_empty() {
-                        let sleep_duration = std::cmp::min(duration, Duration::from_millis(10));
-                        py.allow_threads(|| std::thread::sleep(sleep_duration));
-                    } else {
-                        py.allow_threads(|| std::thread::sleep(duration));
-                    }
-                    continue;
+            if self.tasks_hm.is_empty() && self.pending_io.is_empty() {
+                if self.cmd_rx.is_empty() {
+                    break;
                 }
             }
 
-            if !self.pending_io.is_empty() {
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-
-            if self.tasks_hm.is_empty() {
-                break;
-            }
             py.check_signals()?;
         }
+
         self.shutdown();
         Ok(())
     }
@@ -753,25 +793,51 @@ impl EventLoop {
 }
 
 pub struct RustEventLoop {
-    event_loop: Arc<RefCell<EventLoop>>,
+    event_loop: RefCell<EventLoop>,
+    cmd_tx: Sender<Command>,
 }
+
 impl RustEventLoop {
     pub fn new(py: Python) -> PyResult<Self> {
+        let (cmd_tx, cmd_rx) = cb::unbounded();
+        let (wake_tx, wake_rx) = cb::unbounded();
+        let (io_tx, io_rx) = cb::unbounded();
+
+        
+
+        let event_loop = EventLoop::new(py, wake_rx, wake_tx.clone(), io_rx, io_tx.clone(), cmd_rx)?;
+
         Ok(Self {
-            event_loop: Arc::new(RefCell::new(EventLoop::new(py)?)),
+            event_loop: RefCell::new(event_loop),
+            cmd_tx,
         })
     }
+
     pub fn create_task(&self, gen: &Bound<'_, PyAny>, py: Python) -> RustFuture {
         self.event_loop.borrow_mut().create_task(gen, py)
     }
-    pub fn spawn(&self, gen: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
-        self.event_loop.borrow_mut().spawn(gen, py)
+
+    pub fn spawn(&self, gen: &Bound<'_, PyAny>) -> PyResult<()> {
+        let unbound = gen.clone().unbind();
+        self.cmd_tx.send(Command::Spawn(unbound)).map_err(|_| {
+            PyRuntimeError::new_err("Event loop command channel closed")
+        })?;
+        Ok(())
     }
+
     pub fn run_forever(&self, py: Python) -> PyResult<()> {
         self.event_loop.borrow_mut().run_forever(py)
     }
+
     pub fn run_until_complete(&self, coro: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
         self.event_loop.borrow_mut().run_until_complete(coro, py)
+    }
+
+    pub fn stop(&self) -> PyResult<()> {
+        self.cmd_tx.send(Command::Stop).map_err(|_| {
+            PyRuntimeError::new_err("Event loop command channel closed")
+        })?;
+        Ok(())
     }
 }
 
@@ -779,6 +845,7 @@ impl RustEventLoop {
 pub struct PyEventLoop {
     loop_impl: RustEventLoop,
 }
+
 #[pymethods]
 impl PyEventLoop {
     #[new]
@@ -787,6 +854,7 @@ impl PyEventLoop {
             loop_impl: RustEventLoop::new(py)?,
         })
     }
+
     fn create_task(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
         let fut = slf.borrow().loop_impl.create_task(gen, py);
@@ -794,15 +862,18 @@ impl PyEventLoop {
     }
 
     fn spawn(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<()> {
-        let py = slf.py();
-        let _ = slf.borrow().loop_impl.spawn(gen, py);
-        Ok(())
+        slf.borrow().loop_impl.spawn(gen)
     }
 
     fn run_forever(&self, py: Python) -> PyResult<()> {
         self.loop_impl.run_forever(py)
     }
+
     fn run_until_complete(&self, coro: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
         self.loop_impl.run_until_complete(coro, py)
+    }
+
+    fn stop(&self) -> PyResult<()> {
+        self.loop_impl.stop()
     }
 }

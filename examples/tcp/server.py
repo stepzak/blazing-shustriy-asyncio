@@ -2,28 +2,21 @@ from blazing_shustriy_asyncio import TcpListener, TcpStream
 from blazing_shustriy_asyncio.core.event_loop import EventLoop
 
 async def main(loop: EventLoop):
-    # Сервер
     listener = await TcpListener().bind("127.0.0.1:8080")
-    
+    print("Bound")
     async def handle_client(stream):
+        print("Handling client...")
         while True:
             data = await stream.read(1024)
-            if not data:  # None при закрытии
+            if not data:
                 break
             print(f"Received: {data}")
             await stream.write(b"ECHO: " + data)
     
-    # Принимаем клиентов
     while True:
-        stream, addr = await listener.accept()
+        stream = await listener.accept()
+        print(stream._impl)
         loop.spawn(handle_client(stream=stream))
-    
-    # Клиент
-    stream = await TcpStream.connect("127.0.0.1:8080")
-    await stream.write(b"Hello")
-    response = await stream.read(1024)
-    print(f"Response: {response}")
-    await stream.close()
 
 if __name__ == "__main__":
     loop = EventLoop()

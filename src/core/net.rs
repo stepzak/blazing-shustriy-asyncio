@@ -25,14 +25,17 @@ macro_rules! impl_generator {
 
             fn send(
                 mut slf: PyRefMut<'_, Self>,
-                _value: Option<PyObject>,
+                value: Option<PyObject>,
             ) -> PyResult<Option<PyObject>> {
+                let py = slf.py();
                 if !slf.yielded {
                     slf.yielded = true;
-                    let py = slf.py();
                     Ok(Some(slf.$field.clone_ref(py).into_py_any(py)?))
                 } else {
-                    Err(PyStopIteration::new_err(()))
+                    match value {
+                        Some(val) => Err(PyStopIteration::new_err(val)),
+                        None => Err(PyStopIteration::new_err(py.None())),
+                    }
                 }
             }
 
@@ -40,50 +43,7 @@ macro_rules! impl_generator {
                 _slf: PyRefMut<'_, Self>,
                 exc: Bound<'_, PyAny>,
             ) -> PyResult<Option<PyObject>> {
-                let py_err = PyErr::from_value(exc);
-                Err(py_err)
-            }
-        }
-    };
-
-    ($name:ident, $field:ident, $type:ty, arc) => {
-        #[pymethods]
-        impl $name {
-            fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-                slf
-            }
-
-            fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>> {
-                if !slf.yielded {
-                    slf.yielded = true;
-                    let py = slf.py();
-                    let op = <$type>::from(slf.$field.clone());
-                    Ok(Some(op.into_py_any(py)?))
-                } else {
-                    Err(PyStopIteration::new_err(()))
-                }
-            }
-
-            fn send(
-                mut slf: PyRefMut<'_, Self>,
-                _value: Option<PyObject>,
-            ) -> PyResult<Option<PyObject>> {
-                if !slf.yielded {
-                    slf.yielded = true;
-                    let py = slf.py();
-                    let op = <$type>::from(slf.$field.clone());
-                    Ok(Some(op.into_py_any(py)?))
-                } else {
-                    Err(PyStopIteration::new_err(()))
-                }
-            }
-
-            fn throw(
-                _slf: PyRefMut<'_, Self>,
-                exc: Bound<'_, PyAny>,
-            ) -> PyResult<Option<PyObject>> {
-                let py_err = PyErr::from_value(exc);
-                Err(py_err)
+                Err(PyErr::from_value(exc))
             }
         }
     };
@@ -202,31 +162,29 @@ impl AcceptIoGen {
         if !slf.yielded {
             slf.yielded = true;
             let py = slf.py();
-            let op = AcceptIo {
-                listener_id: slf.listener_id,
-            };
+            let op = AcceptIo::new(slf.listener_id);
             Ok(Some(op.into_py_any(py)?))
         } else {
             Err(PyStopIteration::new_err(()))
         }
     }
 
-    fn send(mut slf: PyRefMut<'_, Self>, _value: Option<PyObject>) -> PyResult<Option<PyObject>> {
+    fn send(mut slf: PyRefMut<'_, Self>, value: Option<PyObject>) -> PyResult<Option<PyObject>> {
+        let py = slf.py();
         if !slf.yielded {
             slf.yielded = true;
-            let py = slf.py();
-            let op = AcceptIo {
-                listener_id: slf.listener_id,
-            };
+            let op = AcceptIo::new(slf.listener_id);
             Ok(Some(op.into_py_any(py)?))
         } else {
-            Err(PyStopIteration::new_err(()))
+            match value {
+                Some(val) => Err(PyStopIteration::new_err(val)),
+                None => Err(PyStopIteration::new_err(py.None())),
+            }
         }
     }
 
     fn throw(_slf: PyRefMut<'_, Self>, exc: Bound<'_, PyAny>) -> PyResult<Option<PyObject>> {
-        let py_err = PyErr::from_value(exc);
-        Err(py_err)
+        Err(PyErr::from_value(exc))
     }
 }
 
@@ -339,7 +297,7 @@ impl PyTcpListener {
 
     pub fn accept(&self) -> PyResult<AcceptIo> {
         match self.listener_id {
-            Some(id) => Ok(AcceptIo { listener_id: id }),
+            Some(id) => Ok(AcceptIo::new(id)),
             None => Err(PyConnectionError::new_err("Socket not yet bound")),
         }
     }
@@ -395,22 +353,14 @@ impl PyTcpStream {
 
     fn read(slf: PyRef<'_, Self>, size: usize) -> PyResult<ReadIo> {
         match slf.stream_id {
-            Some(stream_id) => Ok(ReadIo { size, stream_id }),
+            Some(stream_id) => Ok(ReadIo::new(size, stream_id)),
             None => Err(PyOSError::new_err("Not connected")),
         }
     }
 
     fn write(slf: PyRef<'_, Self>, data: Vec<u8>) -> PyResult<WriteIo> {
         match slf.stream_id {
-            Some(stream_id) => {
-                let l = data.len();
-                Ok(WriteIo {
-                    data,
-                    stream_id,
-                    written: 0,
-                    total: l,
-                })
-            }
+            Some(stream_id) => Ok(WriteIo::new(data, stream_id)),
             None => Err(PyOSError::new_err("Not connected")),
         }
     }
