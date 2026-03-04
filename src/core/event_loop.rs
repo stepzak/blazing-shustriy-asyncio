@@ -1,4 +1,4 @@
-use crossbeam_channel::{self as cb, Receiver, Sender, select};
+use crossbeam_channel::{self as cb, Receiver, Sender};
 use pyo3::{
     exceptions::{PyConnectionError, PyRuntimeError},
     prelude::*,
@@ -7,7 +7,7 @@ use pyo3::{
 };
 use std::{
     cell::RefCell,
-    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     iter,
     net::SocketAddr,
     sync::Arc,
@@ -22,7 +22,6 @@ use crate::core::{
     future::{PyFuture, RustFuture},
     net::{AcceptIo, BindIo, ConnectIo, PyTcpListener, PyTcpStream, ReadIo, WriteIo},
     task::{RustTask, StepResult, TaskId},
-    timers::Timer,
 };
 
 enum IoResult {
@@ -96,7 +95,8 @@ struct TaskEntry {
 struct EventLoop {
     tasks_hm: HashMap<TaskId, TaskEntry>,
     task_deq: VecDeque<TaskId>,
-    timers: BinaryHeap<Timer>,
+    timers: BTreeMap<Instant, Vec<TaskId>>,
+    next_timer: Option<Instant>,
     next_id: TaskId,
     sleep_type: Option<Py<PyAny>>,
     gather_type: Option<Py<PyAny>>,
@@ -141,9 +141,10 @@ impl EventLoop {
             .unbind();
 
         Ok(EventLoop {
-            tasks_hm: HashMap::new(),
-            task_deq: VecDeque::new(),
-            timers: BinaryHeap::new(),
+            tasks_hm: HashMap::with_capacity(1024),
+            task_deq: VecDeque::with_capacity(1024),
+            timers: BTreeMap::new(),
+            next_timer: None,
             next_id: 0,
             sleep_type: Some(sleep_t),
             gather_type: Some(gather_t),
@@ -162,6 +163,33 @@ impl EventLoop {
             next_listener_id: 0,
             pending_streams: HashMap::new(),
         })
+    }
+
+    fn add_timer(&mut self, when: Instant, task_id: TaskId) {
+        self.timers.entry(when).or_insert_with(Vec::new).push(task_id);
+        self.next_timer = self.timers.keys().next().copied();
+    }
+
+    fn check_timers(&mut self) -> Vec<TaskId> {
+        let now = Instant::now();
+        let mut ready = Vec::new();
+        
+        while let Some(&when) = self.next_timer.as_ref() {
+            if when <= now {
+                if let Some(tasks) = self.timers.remove(&when) {
+                    ready.extend(tasks);
+                }
+                self.next_timer = self.timers.keys().next().copied();
+            } else {
+                break;
+            }
+        }
+        
+        ready
+    }
+
+    fn pop_next_task(&mut self) -> Option<TaskId> {
+        self.task_deq.pop_front()
     }
 
     fn create_task(&mut self, gen: &Bound<'_, PyAny>, py: Python) -> RustFuture {
@@ -490,10 +518,7 @@ impl EventLoop {
             if val_binded.is_instance(sleep_type.bind(py))? {
                 let duration: f64 = val_binded.getattr("duration")?.extract()?;
                 let when = Instant::now() + Duration::from_secs_f64(duration);
-                self.timers.push(Timer {
-                    when: when,
-                    task_id: id,
-                });
+                self.add_timer(when, id);
                 return Ok(());
             }
         }
@@ -724,47 +749,71 @@ impl EventLoop {
         Ok(())
     }
 
-    fn check_timers(&mut self) -> PyResult<()> {
-        if let Some(next_timer) = self.timers.peek() {
-            let now = Instant::now();
-            if next_timer.when <= now {
-                let timer = self.timers.pop().unwrap();
-                self.task_deq.push_back(timer.task_id);
-            }
-        }
-        Ok(())
-    }
-
     fn run_forever(&mut self, py: Python) -> PyResult<()> {
         loop {
-            select! {
-                recv(self.wake_rx) -> msg => {
-                    if let Ok((id, res_result)) = msg {
-                        self.handle_wake(id, res_result)?;
-                    }
-                }
-                recv(self.io_rx) -> msg => {
-                    if let Ok((id, result)) = msg {
-                        self.handle_io(id, result, py)?;
-                    }
-                }
-                recv(self.cmd_rx) -> msg => {
-                    if let Ok(cmd) = msg {
-                        self.handle_command(cmd, py)?;
-                    }
-                }
-                default(Duration::from_micros(100)) => {
-                    self.check_timers()?;
+            let mut had_events = false;
+
+            while let Ok((id, res_result)) = self.wake_rx.try_recv() {
+                had_events = true;
+                self.handle_wake(id, res_result)?;
+            }
+
+            while let Ok((id, result)) = self.io_rx.try_recv() {
+                had_events = true;
+                self.handle_io(id, result, py)?;
+            }
+
+            while let Ok(cmd) = self.cmd_rx.try_recv() {
+                had_events = true;
+                self.handle_command(cmd, py)?;
+            }
+
+            let ready_timers = self.check_timers();
+            if !ready_timers.is_empty() {
+                had_events = true;
+                for task_id in ready_timers {
+                    self.task_deq.push_back(task_id);
                 }
             }
 
-            while let Some(id) = self.task_deq.pop_front() {
+            while let Some(id) = self.pop_next_task() {
+                had_events = true;
                 self.run_task(py, id)?;
             }
 
             if self.tasks_hm.is_empty() && self.pending_io.is_empty() {
                 if self.cmd_rx.is_empty() {
                     break;
+                }
+            }
+
+            if !had_events {
+                let sleep_duration = match self.next_timer {
+                    Some(when) => {
+                        let now = Instant::now();
+                        if when > now {
+                            let duration = when - now;
+                            if !self.pending_io.is_empty() {
+                                Some(std::cmp::min(duration, Duration::from_micros(100)))
+                            } else {
+                                Some(duration)
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    None => {
+                        if !self.pending_io.is_empty() {
+                            Some(Duration::from_micros(100))
+                        } else {
+                            None
+                        }
+                    }
+                };
+
+                if let Some(duration) = sleep_duration {
+                    py.allow_threads(|| std::thread::sleep(duration));
+                    continue;
                 }
             }
 
@@ -802,8 +851,6 @@ impl RustEventLoop {
         let (cmd_tx, cmd_rx) = cb::unbounded();
         let (wake_tx, wake_rx) = cb::unbounded();
         let (io_tx, io_rx) = cb::unbounded();
-
-        
 
         let event_loop = EventLoop::new(py, wake_rx, wake_tx.clone(), io_rx, io_tx.clone(), cmd_rx)?;
 
