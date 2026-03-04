@@ -1,11 +1,96 @@
-use std::{net::SocketAddr, sync::Arc};
-use tokio::net::{TcpListener as TokioListener, TcpStream as TokioStream};
-
 use pyo3::{
-    exceptions::{PyConnectionError, PyOSError},
+    exceptions::{PyConnectionError, PyOSError, PyStopIteration},
     prelude::*,
     IntoPyObjectExt,
 };
+use std::{net::SocketAddr, sync::Arc};
+use tokio::net::{TcpListener as TokioListener, TcpStream as TokioStream};
+
+macro_rules! impl_generator {
+    ($name:ident, $field:ident, $type:ty) => {
+        #[pymethods]
+        impl $name {
+            fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+                slf
+            }
+
+            fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>> {
+                if !slf.yielded {
+                    slf.yielded = true;
+                    let py = slf.py();
+                    Ok(Some(slf.$field.clone_ref(py).into_py_any(py)?))
+                } else {
+                    Err(PyStopIteration::new_err(()))
+                }
+            }
+
+            fn send(
+                mut slf: PyRefMut<'_, Self>,
+                _value: Option<PyObject>,
+            ) -> PyResult<Option<PyObject>> {
+                println!("Send");
+                if !slf.yielded {
+                    slf.yielded = true;
+                    let py = slf.py();
+                    Ok(Some(slf.$field.clone_ref(py).into_py_any(py)?))
+                } else {
+                    println!("Stopped iteration");
+                    Err(PyStopIteration::new_err(()))
+                }
+            }
+
+            fn throw(
+                _slf: PyRefMut<'_, Self>,
+                exc: Bound<'_, PyAny>,
+            ) -> PyResult<Option<PyObject>> {
+                let py_err = PyErr::from_value(exc);
+                Err(py_err)
+            }
+        }
+    };
+
+    ($name:ident, $field:ident, $type:ty, arc) => {
+        #[pymethods]
+        impl $name {
+            fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+                slf
+            }
+
+            fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>> {
+                if !slf.yielded {
+                    slf.yielded = true;
+                    let py = slf.py();
+                    let op = <$type>::from(slf.$field.clone());
+                    Ok(Some(op.into_py_any(py)?))
+                } else {
+                    Err(PyStopIteration::new_err(()))
+                }
+            }
+
+            fn send(
+                mut slf: PyRefMut<'_, Self>,
+                _value: Option<PyObject>,
+            ) -> PyResult<Option<PyObject>> {
+                if !slf.yielded {
+                    slf.yielded = true;
+                    let py = slf.py();
+                    let op = <$type>::from(slf.$field.clone());
+                    Ok(Some(op.into_py_any(py)?))
+                } else {
+                    Err(PyStopIteration::new_err(()))
+                }
+            }
+
+            fn throw(
+                _slf: PyRefMut<'_, Self>,
+                exc: Bound<'_, PyAny>,
+            ) -> PyResult<Option<PyObject>> {
+                let py_err = PyErr::from_value(exc);
+                Err(py_err)
+            }
+        }
+    };
+}
 
 #[pyclass]
 pub struct BindIo {
@@ -40,30 +125,7 @@ struct BindIoGen {
     yielded: bool,
 }
 
-#[pymethods]
-impl BindIoGen {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
-        if !slf.yielded {
-            let py = slf.py();
-            slf.yielded = true;
-            if let Ok(bind_op) = slf.bind_io.extract::<PyRef<'_, BindIo>>(py) {
-                let addr = bind_op.addr;
-                let listener_ref = bind_op.pyclass.clone_ref(py);
-
-                let result = (listener_ref, addr.to_string()).into_py_any(py).unwrap();
-                Some(result)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-}
+impl_generator!(BindIoGen, bind_io, BindIo);
 
 #[pyclass]
 pub struct ConnectIo {
@@ -103,22 +165,7 @@ struct ConnectIoGen {
     yielded: bool,
 }
 
-#[pymethods]
-impl ConnectIoGen {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
-        if !slf.yielded {
-            slf.yielded = true;
-            let py = slf.py();
-            Some(slf.connect_io.clone_ref(py).into_py_any(py).unwrap())
-        } else {
-            None
-        }
-    }
-}
+impl_generator!(ConnectIoGen, connect_io, ConnectIo);
 
 #[pyclass(unsendable)]
 pub struct AcceptIo {
@@ -150,23 +197,7 @@ struct AcceptIoGen {
     yielded: bool,
 }
 
-#[pymethods]
-impl AcceptIoGen {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
-        let py = slf.py();
-        if !slf.yielded {
-            slf.yielded = true;
-            let op = AcceptIo::from(slf.listener_arc.clone());
-            Some(op.into_py_any(py).unwrap())
-        } else {
-            None
-        }
-    }
-}
+impl_generator!(AcceptIoGen, listener_arc, AcceptIo, arc);
 
 #[pyclass(unsendable)]
 pub struct ReadIo {
@@ -188,7 +219,7 @@ impl ReadIo {
             read_io: slf.into(),
             yielded: false,
         };
-        Py::new(py, gen)
+        Ok(Py::new(py, gen)?)
     }
 }
 
@@ -198,22 +229,7 @@ struct ReadIoGen {
     yielded: bool,
 }
 
-#[pymethods]
-impl ReadIoGen {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
-        if !slf.yielded {
-            slf.yielded = true;
-            let py = slf.py();
-            Some(slf.read_io.clone_ref(py).into_py_any(py).unwrap())
-        } else {
-            None
-        }
-    }
-}
+impl_generator!(ReadIoGen, read_io, ReadIo);
 
 #[pyclass(unsendable)]
 pub struct WriteIo {
@@ -251,7 +267,7 @@ impl WriteIo {
             write_io: slf.into(),
             yielded: false,
         };
-        Py::new(py, gen)
+        Ok(Py::new(py, gen)?)
     }
 }
 
@@ -261,22 +277,7 @@ struct WriteIoGen {
     yielded: bool,
 }
 
-#[pymethods]
-impl WriteIoGen {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
-        if !slf.yielded {
-            slf.yielded = true;
-            let py = slf.py();
-            Some(slf.write_io.clone_ref(py).into_py_any(py).unwrap())
-        } else {
-            None
-        }
-    }
-}
+impl_generator!(WriteIoGen, write_io, WriteIo);
 
 #[pyclass(unsendable)]
 pub struct PyTcpListener {
@@ -292,10 +293,12 @@ impl PyTcpListener {
 
 #[pymethods]
 impl PyTcpListener {
-
     #[new]
     pub fn new() -> PyResult<Self> {
-        Ok(PyTcpListener {inner: None, addr: String::new()})
+        Ok(PyTcpListener {
+            inner: None,
+            addr: String::new(),
+        })
     }
 
     pub fn bind(slf: PyRef<'_, Self>, addr: &str) -> PyResult<BindIo> {
@@ -340,7 +343,6 @@ impl PyTcpStream {
 
 #[pymethods]
 impl PyTcpStream {
-
     #[new]
     fn new() -> PyResult<Self> {
         Ok(PyTcpStream::empty())
