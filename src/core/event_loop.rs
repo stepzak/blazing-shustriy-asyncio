@@ -753,7 +753,7 @@ impl EventLoop {
                         self.handle_command(cmd, py)?;
                     }
                 }
-                default(Duration::from_millis(10)) => {
+                default(Duration::from_micros(100)) => {
                     self.check_timers()?;
                 }
             }
