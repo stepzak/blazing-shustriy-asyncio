@@ -9,6 +9,7 @@ __pycache__/
 *.so
 test.py
 server.py
+Dockerfile
 # Distribution / packaging
 .Python
 .venv/

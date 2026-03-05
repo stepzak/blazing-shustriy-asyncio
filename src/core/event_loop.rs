@@ -269,24 +269,47 @@ impl EventLoop {
         self.next_listener_id += 1;
         self.pending_listeners.insert(listener_id, pyclass);
         self.tokio_runtime.spawn(async move {
-            let listener = TokioListener::bind(addr).await;
-            match listener {
-                Ok(socket) => {
+            let result = (|| -> Result<TokioListener, Box<dyn std::error::Error>> {
+                use socket2::{Domain, Protocol, Socket, Type};
+
+                let domain = if addr.is_ipv4() {
+                    Domain::IPV4
+                } else {
+                    Domain::IPV6
+                };
+                let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+
+                socket.set_reuse_address(true)?;
+                #[cfg(unix)]
+                socket.set_reuse_port(true)?;
+
+                socket.bind(&addr.into())?;
+                socket.listen(1024)?;
+
+                socket.set_nonblocking(true)?;
+
+                let std_listener: std::net::TcpListener = socket.into();
+                Ok(TokioListener::from_std(std_listener)?)
+            })();
+
+            match result {
+                Ok(listener) => {
                     let _ = tx.send((
                         id,
                         IoResult::Bind {
                             listener_id,
-                            listener: socket,
+                            listener,
                             addr,
                         },
                     ));
                 }
                 Err(e) => {
-                    let err = PyConnectionError::new_err(format!("Bind error: {}", e));
+                    let err = PyConnectionError::new_err(format!("Socket error: {}", e));
                     let _ = tx.send((id, IoResult::Error(err)));
                 }
             }
         });
+
         Ok(())
     }
 
