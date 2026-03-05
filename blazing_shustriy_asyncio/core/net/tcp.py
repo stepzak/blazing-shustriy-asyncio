@@ -12,7 +12,6 @@ class TcpListener:
     
     async def accept(self):
         stream_impl = await self._impl.accept()
-        print(stream_impl)
         stream = TcpStream()
         stream._impl = stream_impl
         return stream

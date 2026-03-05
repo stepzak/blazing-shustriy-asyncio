@@ -224,27 +224,11 @@ impl_generator!(ReadIoGen, read_io, ReadIo);
 pub struct WriteIo {
     pub data: Vec<u8>,
     pub stream_id: usize,
-    pub written: usize,
-    pub total: usize,
 }
 
 impl WriteIo {
     pub fn new(data: Vec<u8>, stream_id: usize) -> Self {
-        let total = data.len();
-        WriteIo {
-            data,
-            stream_id,
-            written: 0,
-            total,
-        }
-    }
-
-    pub fn remaining(&self) -> usize {
-        self.total - self.written
-    }
-
-    pub fn is_complete(&self) -> bool {
-        self.written >= self.total
+        WriteIo { data, stream_id }
     }
 }
 
