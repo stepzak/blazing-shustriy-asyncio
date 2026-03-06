@@ -8,8 +8,8 @@ struct Task {
 }
 
 pub enum StepResult {
-    Yield(PyObject),
-    Success(PyObject),
+    Yield(Py<PyAny>),
+    Success(Py<PyAny>),
     Failure(PyErr),
 }
 
@@ -25,7 +25,7 @@ impl Task {
 
     fn call_method<F>(&self, method: F, py: Python) -> StepResult
     where
-        F: FnOnce(&Bound<'_, PyAny>) -> PyResult<PyObject>,
+        F: FnOnce(&Bound<'_, PyAny>) -> PyResult<Py<PyAny>>,
     {
         let coro = self.coro.bind(py);
 
@@ -35,7 +35,7 @@ impl Task {
                 if e.is_instance_of::<PyStopIteration>(py) {
                     let exc_value = e.value(py);
 
-                    let res_obj: PyObject = exc_value
+                    let res_obj: Py<PyAny> = exc_value
                         .getattr("value")
                         .map(|b| b.into())
                         .unwrap_or_else(|_| py.None())
@@ -58,7 +58,7 @@ impl Task {
         )
     }
 
-    fn step(&self, val: Option<PyObject>, py: Python) -> StepResult {
+    fn step(&self, val: Option<Py<PyAny>>, py: Python) -> StepResult {
         self.call_method(
             |coro| {
                 let send_method = coro.getattr("send")?;
@@ -85,7 +85,7 @@ impl RustTask {
         }
     }
 
-    pub fn step(&self, val: Option<PyObject>, py: Python) -> StepResult {
+    pub fn step(&self, val: Option<Py<PyAny>>, py: Python) -> StepResult {
         self.inner.borrow().step(val, py)
     }
 

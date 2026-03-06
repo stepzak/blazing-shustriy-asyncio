@@ -19,23 +19,25 @@ use tokio::{
     sync::mpsc,
 };
 
-use crate::core::{
-    con_worker::connection_worker,
-    future::{PyFuture, RustFuture},
-    io_enums::{ConnectionWorker, IoResult, WorkerCommand},
-    net::{AcceptIo, BindIo, ConnectIo, PyTcpListener, PyTcpStream, ReadIo, WriteIo},
-    task::{RustTask, StepResult, TaskId},
+use crate::{
+    core::{
+        commands::Command,
+        con_worker::{WorkerMode, connection_worker},
+        future::{PyFuture, RustFuture},
+        io_enums::{ConnectionWorker, IoResult, WorkerCommand},
+        net::{AcceptIo, BindIo, ConnectIo, PyTcpListener, PyTcpStream, ReadIo, WriteIo},
+        task::{RustTask, StepResult, TaskId},
+    },
+    http::{
+        helpers::{convert_to_response, format_500_error, format_http_response},
+        request::BlazingRequest,
+    },
 };
-
-enum Command {
-    Spawn(Py<PyAny>),
-    Stop,
-}
 
 struct GatherState {
     total: usize,
     completed: usize,
-    results: Option<Vec<Option<PyObject>>>,
+    results: Option<Vec<Option<Py<PyAny>>>>,
 }
 
 impl GatherState {
@@ -44,13 +46,13 @@ impl GatherState {
             total,
             completed: 0,
             results: Some(
-                iter::repeat_with(|| None as Option<PyObject>)
+                iter::repeat_with(|| None as Option<Py<PyAny>>)
                     .take(total)
                     .collect(),
             ),
         }
     }
-    fn add_result(&mut self, idx: usize, res: PyObject) -> Option<Vec<PyObject>> {
+    fn add_result(&mut self, idx: usize, res: Py<PyAny>) -> Option<Vec<Py<PyAny>>> {
         if let Some(vec) = self.results.as_mut() {
             vec[idx] = Some(res);
             self.completed += 1;
@@ -66,7 +68,7 @@ impl GatherState {
 struct TaskEntry {
     task: RustTask,
     future: RustFuture,
-    pending_val: Option<PyObject>,
+    pending_val: Option<Py<PyAny>>,
     pending_err: Option<PyErr>,
 }
 
@@ -79,8 +81,8 @@ struct EventLoop {
     sleep_type: Option<Py<PyAny>>,
     gather_type: Option<Py<PyAny>>,
     future_type: Option<Py<PyAny>>,
-    wake_rx: Receiver<(TaskId, Result<PyObject, PyErr>)>,
-    wake_tx: Sender<(TaskId, Result<PyObject, PyErr>)>,
+    wake_rx: Receiver<(TaskId, Result<Py<PyAny>, PyErr>)>,
+    wake_tx: Sender<(TaskId, Result<Py<PyAny>, PyErr>)>,
     pending_io: HashSet<TaskId>,
     tokio_runtime: Runtime,
     io_rx: Receiver<(usize, IoResult)>,
@@ -97,8 +99,8 @@ struct EventLoop {
 impl EventLoop {
     fn new(
         py: Python,
-        wake_rx: Receiver<(TaskId, Result<PyObject, PyErr>)>,
-        wake_tx: Sender<(TaskId, Result<PyObject, PyErr>)>,
+        wake_rx: Receiver<(TaskId, Result<Py<PyAny>, PyErr>)>,
+        wake_tx: Sender<(TaskId, Result<Py<PyAny>, PyErr>)>,
         io_rx: Receiver<(usize, IoResult)>,
         io_tx: Sender<(usize, IoResult)>,
         cmd_rx: Receiver<Command>,
@@ -178,7 +180,12 @@ impl EventLoop {
         self.task_deq.pop_front()
     }
 
-    fn create_task(&mut self, gen: &Bound<'_, PyAny>, py: Python) -> RustFuture {
+    fn create_task(
+        &mut self,
+        gen: &Bound<'_, PyAny>,
+        py: Python,
+        t_id: Option<TaskId>,
+    ) -> RustFuture {
         let coro = if gen.hasattr("__await__").unwrap_or(false) {
             match gen.call_method0("__await__") {
                 Ok(x) => x,
@@ -191,8 +198,13 @@ impl EventLoop {
         } else {
             gen.clone()
         };
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = match t_id {
+            Some(x) => x,
+            None => {
+                self.next_id += 1;
+                self.next_id - 1
+            }
+        };
         let task = RustTask::new(&coro);
         let fut = RustFuture::new();
 
@@ -489,7 +501,7 @@ impl EventLoop {
                     let my_id = id;
 
                     inner_future.add_callback(
-                        move |res: PyObject| {
+                        move |res: Py<PyAny>| {
                             tx_clone.send((my_id, Ok(res))).ok();
                         },
                         py,
@@ -507,7 +519,7 @@ impl EventLoop {
             }
         }
         if val_binded.hasattr("send").unwrap_or(false) {
-            let child_future = self.create_task(val_binded.downcast()?, py);
+            let child_future = self.create_task(val_binded.cast()?, py, None);
             let child_id = self.next_id - 1;
             self.schedule_task(child_id);
 
@@ -539,7 +551,7 @@ impl EventLoop {
 
     fn handle_gather(&mut self, id: TaskId, gather: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
         let attr = gather.getattr("coros")?;
-        let coros = attr.downcast::<PyTuple>()?;
+        let coros = attr.cast::<PyTuple>()?;
         let total = coros.len();
 
         let state = Arc::new(RefCell::new(GatherState::new(total)));
@@ -550,7 +562,7 @@ impl EventLoop {
             if !coro.hasattr("send").unwrap_or(false) {
                 return Err(PyRuntimeError::new_err("All args must be generators"));
             }
-            let child_fut = self.create_task(coro.downcast()?, py);
+            let child_fut = self.create_task(coro.cast()?, py, None);
             let child_id = self.next_id - 1;
             self.schedule_task(child_id);
 
@@ -565,7 +577,7 @@ impl EventLoop {
                         s.add_result(my_idx, res)
                     };
                     if let Some(list) = maybe_list {
-                        Python::with_gil(|py| {
+                        Python::attach(|py| {
                             let py_list = PyList::new(py, list).unwrap();
                             tx_cb.send((my_id, Ok(py_list.into()))).ok();
                         });
@@ -584,7 +596,7 @@ impl EventLoop {
         Ok(())
     }
 
-    fn handle_wake(&mut self, id: TaskId, res_result: Result<PyObject, PyErr>) -> PyResult<()> {
+    fn handle_wake(&mut self, id: TaskId, res_result: Result<Py<PyAny>, PyErr>) -> PyResult<()> {
         self.pending_io.remove(&id);
         if let Some(entry) = self.tasks_hm.get_mut(&id) {
             match res_result {
@@ -647,7 +659,7 @@ impl EventLoop {
                 }
                 let io_tx = self.io_tx.clone();
                 self.tokio_runtime
-                    .spawn(async move { connection_worker(stream, cmd_rx, io_tx).await });
+                    .spawn(async move { connection_worker(WorkerMode::Default { cmd_rx, io_tx }, stream).await });
             }
             IoResult::Connect {
                 stream_id,
@@ -671,7 +683,7 @@ impl EventLoop {
                     );
                     let io_tx = self.io_tx.clone();
                     self.tokio_runtime
-                        .spawn(async move { connection_worker(stream, cmd_rx, io_tx).await });
+                        .spawn(async move { connection_worker(WorkerMode::Default { cmd_rx, io_tx }, stream).await });
 
                     if let Some(entry) = self.tasks_hm.get_mut(&id) {
                         entry.pending_val =
@@ -709,11 +721,58 @@ impl EventLoop {
 
     fn handle_command(&mut self, cmd: Command, py: Python) -> PyResult<()> {
         match cmd {
-            Command::Spawn(gen) => {
-                let gen_bound = gen.bind(py);
-                self.create_task(gen_bound, py);
-                let id = self.next_id - 1;
+            Command::Spawn { coro, id } => {
+                let gen_bound = coro.bind(py);
+                self.create_task(gen_bound, py, Some(id));
                 self.schedule_task(id);
+            }
+            Command::ExecuteHttp {
+                handler,
+                method,
+                path,
+                headers,
+                query,
+                body,
+                response_tx,
+            } => {
+                let pyreq = BlazingRequest::new(method, path, query, headers, body);
+                let gen = match handler.call1(py, (pyreq,)) {
+                    Ok(x) => x,
+                    Err(_) => {
+                        let raw_http = format_500_error();
+                        let _ = response_tx.blocking_send(raw_http);
+                        return Err(PyRuntimeError::new_err(format!(
+                            "{} is not a coroutine",
+                            handler.getattr(py, "__name__").unwrap().to_string()
+                        )));
+                    }
+                };
+                let task_id = self.next_id;
+                self.next_id += 1;
+
+                let bound = gen.bind(py);
+                let fut = self.create_task(bound, py, Some(task_id));
+                let tx_clone = response_tx.clone();
+                fut.add_callback(
+                    move |res: Py<PyAny>| {
+                        Python::attach(|py_| {
+                            let response = convert_to_response(py_, res);
+                            let raw_http = format_http_response(&response);
+                            let _ = tx_clone.blocking_send(raw_http);
+                        })
+                    },
+                    py,
+                );
+                let tx_clone = response_tx.clone();
+                fut.add_err_callback(
+                    move |_| {
+                        let raw_http = format_500_error();
+                        let _ = tx_clone.blocking_send(raw_http);
+                    },
+                    py,
+                );
+
+                self.schedule_task(task_id);
             }
             Command::Stop => {
                 self.shutdown();
@@ -785,7 +844,7 @@ impl EventLoop {
                 };
 
                 if let Some(duration) = sleep_duration {
-                    py.allow_threads(|| std::thread::sleep(duration));
+                    py.detach(|| std::thread::sleep(duration));
                     continue;
                 }
             }
@@ -798,7 +857,7 @@ impl EventLoop {
     }
 
     fn run_until_complete(&mut self, coro: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
-        self.create_task(coro, py);
+        self.create_task(coro, py, None);
         let id = self.next_id - 1;
         self.schedule_task(id);
         self.run_forever(py)
@@ -835,15 +894,22 @@ impl RustEventLoop {
     }
 
     pub fn create_task(&self, gen: &Bound<'_, PyAny>, py: Python) -> RustFuture {
-        self.event_loop.borrow_mut().create_task(gen, py)
+        self.event_loop.borrow_mut().create_task(gen, py, None)
     }
 
-    pub fn spawn(&self, gen: &Bound<'_, PyAny>) -> PyResult<()> {
+    pub fn spawn(&self, gen: &Bound<'_, PyAny>) -> PyResult<usize> {
         let unbound = gen.clone().unbind();
+        let mut loop_ref = self.event_loop.borrow_mut();
+        let task_id = loop_ref.next_id;
+        loop_ref.next_id += 1;
+        drop(loop_ref);
         self.cmd_tx
-            .send(Command::Spawn(unbound))
+            .send(Command::Spawn {
+                coro: unbound,
+                id: task_id,
+            })
             .map_err(|_| PyRuntimeError::new_err("Event loop command channel closed"))?;
-        Ok(())
+        Ok(task_id)
     }
 
     pub fn run_forever(&self, py: Python) -> PyResult<()> {
@@ -883,7 +949,8 @@ impl PyEventLoop {
     }
 
     fn spawn(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<()> {
-        slf.borrow().loop_impl.spawn(gen)
+        slf.borrow().loop_impl.spawn(gen)?;
+        Ok(())
     }
 
     fn run_forever(&self, py: Python) -> PyResult<()> {

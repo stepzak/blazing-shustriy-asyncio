@@ -87,7 +87,7 @@ impl PySemaphore {
         self.semaphore.release(py)
     }
 
-    pub fn __aenter__(slf: PyRef<'_, Self>) -> PyResult<PyObject> {
+    pub fn __aenter__(slf: PyRef<'_, Self>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
         helpers::primitive_aenter(|p| slf.acquire(p), py)
     }
@@ -97,7 +97,7 @@ impl PySemaphore {
         _exc_type: Option<&Bound<'_, PyAny>>,
         _exc_val: Option<&Bound<'_, PyAny>>,
         _exc_tb: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Option<PyObject>> {
+    ) -> PyResult<Option<Py<PyAny>>> {
         let py = slf.py();
         helpers::primitive_aexit(|p| slf.semaphore.release(p), py)
     }

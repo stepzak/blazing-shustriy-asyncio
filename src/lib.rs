@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod core;
+mod http;
 mod sync;
 
 /// A Python module implemented in Rust.

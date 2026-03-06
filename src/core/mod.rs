@@ -1,3 +1,4 @@
+mod commands;
 mod con_worker;
 pub mod event_loop;
 pub mod future;

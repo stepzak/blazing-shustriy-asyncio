@@ -13,7 +13,7 @@ macro_rules! impl_generator {
                 slf
             }
 
-            fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>> {
+            fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
                 if !slf.yielded {
                     slf.yielded = true;
                     let py = slf.py();
@@ -25,8 +25,8 @@ macro_rules! impl_generator {
 
             fn send(
                 mut slf: PyRefMut<'_, Self>,
-                value: Option<PyObject>,
-            ) -> PyResult<Option<PyObject>> {
+                value: Option<Py<PyAny>>,
+            ) -> PyResult<Option<Py<PyAny>>> {
                 let py = slf.py();
                 if !slf.yielded {
                     slf.yielded = true;
@@ -42,7 +42,7 @@ macro_rules! impl_generator {
             fn throw(
                 _slf: PyRefMut<'_, Self>,
                 exc: Bound<'_, PyAny>,
-            ) -> PyResult<Option<PyObject>> {
+            ) -> PyResult<Option<Py<PyAny>>> {
                 Err(PyErr::from_value(exc))
             }
         }
@@ -158,7 +158,7 @@ impl AcceptIoGen {
         slf
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>> {
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
         if !slf.yielded {
             slf.yielded = true;
             let py = slf.py();
@@ -169,7 +169,7 @@ impl AcceptIoGen {
         }
     }
 
-    fn send(mut slf: PyRefMut<'_, Self>, value: Option<PyObject>) -> PyResult<Option<PyObject>> {
+    fn send(mut slf: PyRefMut<'_, Self>, value: Option<Py<PyAny>>) -> PyResult<Option<Py<PyAny>>> {
         let py = slf.py();
         if !slf.yielded {
             slf.yielded = true;
@@ -183,7 +183,7 @@ impl AcceptIoGen {
         }
     }
 
-    fn throw(_slf: PyRefMut<'_, Self>, exc: Bound<'_, PyAny>) -> PyResult<Option<PyObject>> {
+    fn throw(_slf: PyRefMut<'_, Self>, exc: Bound<'_, PyAny>) -> PyResult<Option<Py<PyAny>>> {
         Err(PyErr::from_value(exc))
     }
 }

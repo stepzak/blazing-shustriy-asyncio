@@ -97,7 +97,7 @@ impl PyLock {
         self.lock.locked()
     }
 
-    fn __aenter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<PyObject> {
+    fn __aenter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<Py<PyAny>> {
         helpers::primitive_aenter(|p| slf.acquire(p), py)
     }
 
@@ -107,7 +107,7 @@ impl PyLock {
         _exc_type: Option<&Bound<'_, PyAny>>,
         _exc_val: Option<&Bound<'_, PyAny>>,
         _exc_tb: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Option<PyObject>> {
+    ) -> PyResult<Option<Py<PyAny>>> {
         helpers::primitive_aexit(|p| self.release(p), py)
     }
 }

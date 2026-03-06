@@ -6,12 +6,12 @@ use pyo3::{
     IntoPyObjectExt,
 };
 
-pub type CallbackSuccess = Box<dyn FnOnce(PyObject)>;
+pub type CallbackSuccess = Box<dyn FnOnce(Py<PyAny>)>;
 type CallbackErr = Box<dyn FnOnce(PyErr)>;
 
 enum FutureState {
     Pending,
-    Success(PyObject),
+    Success(Py<PyAny>),
     Failure(PyErr),
 }
 
@@ -32,7 +32,7 @@ impl Future {
 
     fn add_callback<F>(&mut self, callback: F, py: Python)
     where
-        F: FnOnce(PyObject) + 'static,
+        F: FnOnce(Py<PyAny>) + 'static,
     {
         match &self.state {
             FutureState::Pending => {
@@ -64,7 +64,7 @@ impl Future {
         }
     }
 
-    fn set_result(&mut self, res: PyObject, py: Python) -> PyResult<()> {
+    fn set_result(&mut self, res: Py<PyAny>, py: Python) -> PyResult<()> {
         let callbacks = match &self.state {
             FutureState::Pending => {
                 self.state = FutureState::Success(res.clone_ref(py));
@@ -105,7 +105,7 @@ impl Future {
         return !matches!(self.state, FutureState::Pending);
     }
 
-    fn result(&self, py: Python) -> PyResult<Option<PyObject>> {
+    fn result(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
         match &self.state {
             FutureState::Pending => Err(PyRuntimeError::new_err("Future is not yet finished")),
             FutureState::Success(val) => Ok(Some(val.clone_ref(py))),
@@ -128,7 +128,7 @@ impl RustFuture {
 
     pub fn add_callback<F>(&self, callback: F, py: Python)
     where
-        F: FnOnce(PyObject) + 'static,
+        F: FnOnce(Py<PyAny>) + 'static,
     {
         self.inner.borrow_mut().add_callback(callback, py);
     }
@@ -140,7 +140,7 @@ impl RustFuture {
         self.inner.borrow_mut().add_err_callback(callback, py);
     }
 
-    pub fn set_result(&self, res: PyObject, py: Python) -> PyResult<()> {
+    pub fn set_result(&self, res: Py<PyAny>, py: Python) -> PyResult<()> {
         self.inner.borrow_mut().set_result(res, py)
     }
 
@@ -152,7 +152,7 @@ impl RustFuture {
         self.inner.borrow().is_done()
     }
 
-    pub fn result(&self, py: Python) -> PyResult<Option<PyObject>> {
+    pub fn result(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
         self.inner.borrow().result(py)
     }
 }
@@ -177,7 +177,7 @@ impl PyFuture {
         }
     }
 
-    pub fn set_result(&self, py: Python, val: PyObject) -> PyResult<()> {
+    pub fn set_result(&self, py: Python, val: Py<PyAny>) -> PyResult<()> {
         self.future.set_result(val, py)
     }
 
@@ -193,7 +193,7 @@ impl PyFuture {
         slf
     }
 
-    pub fn __next__(slf: PyRef<'_, Self>, py: Python) -> PyResult<Option<PyObject>> {
+    pub fn __next__(slf: PyRef<'_, Self>, py: Python) -> PyResult<Option<Py<PyAny>>> {
         if slf.is_done() {
             let res = slf.future.result(py)?;
             Err(PyStopIteration::new_err(res.unwrap_or_else(|| py.None())))
