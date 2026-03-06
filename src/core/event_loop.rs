@@ -10,7 +10,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     iter,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -22,15 +22,18 @@ use tokio::{
 use crate::{
     core::{
         commands::Command,
-        con_worker::{WorkerMode, connection_worker},
+        con_worker::{connection_worker, WorkerMode},
         future::{PyFuture, RustFuture},
         io_enums::{ConnectionWorker, IoResult, WorkerCommand},
-        net::{AcceptIo, BindIo, ConnectIo, PyTcpListener, PyTcpStream, ReadIo, WriteIo},
+        net::{
+            AcceptIo, BindIo, ConnectIo, ListenerMode, PyTcpListener, PyTcpStream, ReadIo, WriteIo,
+        },
         task::{RustTask, StepResult, TaskId},
     },
     http::{
         helpers::{convert_to_response, format_500_error, format_http_response},
         request::BlazingRequest,
+        router::RustRouter,
     },
 };
 
@@ -72,6 +75,13 @@ struct TaskEntry {
     pending_err: Option<PyErr>,
 }
 
+struct ListenerEntry {
+    listener: Arc<TokioListener>,
+    _addr: SocketAddr,
+    _py_obj: Py<PyTcpListener>,
+    mode: ListenerMode,
+}
+
 struct EventLoop {
     tasks_hm: HashMap<TaskId, TaskEntry>,
     task_deq: VecDeque<TaskId>,
@@ -87,9 +97,10 @@ struct EventLoop {
     tokio_runtime: Runtime,
     io_rx: Receiver<(usize, IoResult)>,
     io_tx: Sender<(usize, IoResult)>,
+    cmd_tx: Sender<Command>,
     cmd_rx: Receiver<Command>,
     pending_listeners: HashMap<usize, Py<PyTcpListener>>,
-    listeners: HashMap<usize, (Arc<TokioListener>, SocketAddr, Py<PyTcpListener>)>,
+    listeners: HashMap<usize, ListenerEntry>,
     next_listener_id: usize,
     pending_streams: HashMap<usize, Py<PyTcpStream>>,
     next_stream_id: usize,
@@ -103,6 +114,7 @@ impl EventLoop {
         wake_tx: Sender<(TaskId, Result<Py<PyAny>, PyErr>)>,
         io_rx: Receiver<(usize, IoResult)>,
         io_tx: Sender<(usize, IoResult)>,
+        cmd_tx: Sender<Command>,
         cmd_rx: Receiver<Command>,
     ) -> PyResult<Self> {
         let module = PyModule::import(py, "blazing_shustriy_asyncio")?;
@@ -140,6 +152,7 @@ impl EventLoop {
             tokio_runtime: rt,
             io_rx,
             io_tx,
+            cmd_tx,
             cmd_rx,
             pending_listeners: HashMap::new(),
             listeners: HashMap::new(),
@@ -274,7 +287,12 @@ impl EventLoop {
         id: TaskId,
         addr: SocketAddr,
         pyclass: Py<PyTcpListener>,
+        router: Option<Arc<RwLock<RustRouter>>>,
     ) -> PyResult<()> {
+        let mut mode = ListenerMode::Raw;
+        if let Some(r) = router {
+            mode = ListenerMode::Http(r);
+        }
         let tx = self.io_tx.clone();
         self.pending_io.insert(id);
         let listener_id = self.next_listener_id;
@@ -312,6 +330,7 @@ impl EventLoop {
                             listener_id,
                             listener,
                             addr,
+                            mode,
                         },
                     ));
                 }
@@ -332,8 +351,8 @@ impl EventLoop {
         self.next_stream_id += 1;
 
         if let Some(entry) = self.listeners.get(&listener_id) {
-            let (listener_arc, _, _) = entry;
-            let listener = Arc::clone(listener_arc);
+            let listener = Arc::clone(&entry.listener);
+            let mode = entry.mode.clone();
             self.tokio_runtime.spawn(async move {
                 let res = listener.accept().await;
                 match res {
@@ -344,6 +363,7 @@ impl EventLoop {
                                 stream_id,
                                 stream: stream,
                                 addr,
+                                mode,
                             },
                         ));
                     }
@@ -448,8 +468,14 @@ impl EventLoop {
         let val_binded = val.bind(py);
 
         if let Ok(bind) = val_binded.extract::<Py<BindIo>>() {
-            let binded = bind.bind(py).borrow_mut();
-            return self.handle_bind(id, binded.addr, binded.pyclass.clone_ref(py));
+            let binded = bind.bind(py).borrow();
+            let pyroute = binded.router.as_ref();
+            let mut router = None;
+            if let Some(r) = pyroute {
+                let bound = r.bind(py).borrow();
+                router = Some(bound.inner.clone());
+            }
+            return self.handle_bind(id, binded.addr, binded.pyclass.clone_ref(py), router);
         }
 
         if let Ok(accept) = val_binded.extract::<Py<AcceptIo>>() {
@@ -615,6 +641,7 @@ impl EventLoop {
                 listener_id,
                 listener,
                 addr,
+                mode,
             } => {
                 if let Some(pyclass) = self.pending_listeners.remove(&listener_id) {
                     if let Ok(mut py_listener) = pyclass.bind(py).try_borrow_mut() {
@@ -622,7 +649,12 @@ impl EventLoop {
                     }
                     self.listeners.insert(
                         listener_id,
-                        (Arc::new(listener), addr, pyclass.clone_ref(py)),
+                        ListenerEntry {
+                            listener: Arc::new(listener),
+                            _addr: addr,
+                            _py_obj: pyclass.clone_ref(py),
+                            mode,
+                        },
                     );
                     if let Some(entry) = self.tasks_hm.get_mut(&id) {
                         entry.pending_val =
@@ -635,6 +667,7 @@ impl EventLoop {
                 stream_id,
                 stream,
                 addr,
+                mode,
             } => {
                 let pystream = PyTcpStream {
                     stream_id: Some(stream_id),
@@ -658,8 +691,13 @@ impl EventLoop {
                     self.task_deq.push_back(id);
                 }
                 let io_tx = self.io_tx.clone();
+                let cmd_tx = self.cmd_tx.clone();
+                let wrk_mode = match mode {
+                    ListenerMode::Raw => WorkerMode::Default { cmd_rx, io_tx },
+                    ListenerMode::Http(r) => WorkerMode::Http { cmd_tx, router: r },
+                };
                 self.tokio_runtime
-                    .spawn(async move { connection_worker(WorkerMode::Default { cmd_rx, io_tx }, stream).await });
+                    .spawn(async move { connection_worker(wrk_mode, stream).await });
             }
             IoResult::Connect {
                 stream_id,
@@ -682,8 +720,9 @@ impl EventLoop {
                         },
                     );
                     let io_tx = self.io_tx.clone();
-                    self.tokio_runtime
-                        .spawn(async move { connection_worker(WorkerMode::Default { cmd_rx, io_tx }, stream).await });
+                    self.tokio_runtime.spawn(async move {
+                        connection_worker(WorkerMode::Default { cmd_rx, io_tx }, stream).await
+                    });
 
                     if let Some(entry) = self.tasks_hm.get_mut(&id) {
                         entry.pending_val =
@@ -884,8 +923,15 @@ impl RustEventLoop {
         let (wake_tx, wake_rx) = cb::unbounded();
         let (io_tx, io_rx) = cb::unbounded();
 
-        let event_loop =
-            EventLoop::new(py, wake_rx, wake_tx.clone(), io_rx, io_tx.clone(), cmd_rx)?;
+        let event_loop = EventLoop::new(
+            py,
+            wake_rx,
+            wake_tx.clone(),
+            io_rx,
+            io_tx.clone(),
+            cmd_tx.clone(),
+            cmd_rx,
+        )?;
 
         Ok(Self {
             event_loop: RefCell::new(event_loop),

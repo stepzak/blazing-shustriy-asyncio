@@ -1,9 +1,20 @@
 use pyo3::{
-    exceptions::{PyConnectionError, PyOSError, PyStopIteration},
+    exceptions::{PyConnectionError, PyOSError, PyRuntimeError, PyStopIteration},
     prelude::*,
     IntoPyObjectExt,
 };
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+};
+
+use crate::http::router::{PyRouter, RustRouter};
+
+#[derive(Clone)]
+pub enum ListenerMode {
+    Raw,
+    Http(Arc<RwLock<RustRouter>>),
+}
 
 macro_rules! impl_generator {
     ($name:ident, $field:ident, $type:ty) => {
@@ -53,13 +64,15 @@ macro_rules! impl_generator {
 pub struct BindIo {
     pub addr: SocketAddr,
     pub pyclass: Py<PyTcpListener>,
+    pub router: Option<Py<PyRouter>>,
 }
 
 impl BindIo {
-    fn new(addr: SocketAddr, pylistener: Py<PyTcpListener>) -> Self {
+    fn new(addr: SocketAddr, pylistener: Py<PyTcpListener>, router: Option<Py<PyRouter>>) -> Self {
         BindIo {
             addr,
             pyclass: pylistener,
+            router,
         }
     }
 }
@@ -127,11 +140,15 @@ impl_generator!(ConnectIoGen, connect_io, ConnectIo);
 #[pyclass(unsendable)]
 pub struct AcceptIo {
     pub listener_id: usize,
+    pub http_mode: bool,
 }
 
 impl AcceptIo {
-    pub fn new(listener_id: usize) -> Self {
-        AcceptIo { listener_id }
+    pub fn new(listener_id: usize, http_mode: bool) -> Self {
+        AcceptIo {
+            listener_id,
+            http_mode,
+        }
     }
 }
 
@@ -141,6 +158,7 @@ impl AcceptIo {
         let gen = AcceptIoGen {
             listener_id: slf.listener_id,
             yielded: false,
+            http_mode: slf.http_mode,
         };
         Py::new(slf.py(), gen)
     }
@@ -150,6 +168,7 @@ impl AcceptIo {
 struct AcceptIoGen {
     listener_id: usize,
     yielded: bool,
+    http_mode: bool,
 }
 
 #[pymethods]
@@ -162,7 +181,7 @@ impl AcceptIoGen {
         if !slf.yielded {
             slf.yielded = true;
             let py = slf.py();
-            let op = AcceptIo::new(slf.listener_id);
+            let op = AcceptIo::new(slf.listener_id, slf.http_mode);
             Ok(Some(op.into_py_any(py)?))
         } else {
             Err(PyStopIteration::new_err(()))
@@ -173,7 +192,7 @@ impl AcceptIoGen {
         let py = slf.py();
         if !slf.yielded {
             slf.yielded = true;
-            let op = AcceptIo::new(slf.listener_id);
+            let op = AcceptIo::new(slf.listener_id, slf.http_mode);
             Ok(Some(op.into_py_any(py)?))
         } else {
             match value {
@@ -256,6 +275,7 @@ impl_generator!(WriteIoGen, write_io, WriteIo);
 pub struct PyTcpListener {
     pub addr: String,
     pub listener_id: Option<usize>,
+    pub http_mode: bool,
 }
 
 impl PyTcpListener {
@@ -271,17 +291,32 @@ impl PyTcpListener {
         Ok(PyTcpListener {
             addr: String::new(),
             listener_id: None,
+            http_mode: false,
         })
     }
 
-    pub fn bind(slf: PyRef<'_, Self>, addr: &str) -> PyResult<BindIo> {
+    pub fn bind(
+        slf: PyRef<'_, Self>,
+        addr: &str,
+        router: Option<Py<PyRouter>>,
+    ) -> PyResult<BindIo> {
         let parsed = addr.parse::<SocketAddr>()?;
-        Ok(BindIo::new(parsed, slf.into()))
+        Ok(BindIo::new(parsed, slf.into(), router))
+    }
+
+    pub fn set_http_mode(&mut self, flag: bool) -> PyResult<()> {
+        match self.listener_id {
+            Some(_) => Err(PyRuntimeError::new_err("Listener already bound")),
+            None => {
+                self.http_mode = flag;
+                Ok(())
+            }
+        }
     }
 
     pub fn accept(&self) -> PyResult<AcceptIo> {
         match self.listener_id {
-            Some(id) => Ok(AcceptIo::new(id)),
+            Some(id) => Ok(AcceptIo::new(id, self.http_mode)),
             None => Err(PyConnectionError::new_err("Socket not yet bound")),
         }
     }

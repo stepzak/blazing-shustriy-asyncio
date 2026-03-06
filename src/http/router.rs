@@ -1,6 +1,12 @@
 use matchit::Router as MatchitRouter;
-use pyo3::{exceptions::PyValueError, prelude::*};
-use std::collections::HashMap;
+use pyo3::{
+    exceptions::{PyRuntimeError, PyValueError},
+    prelude::*,
+};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 pub enum RouteMatch {
     Found {
@@ -84,7 +90,7 @@ impl RustRouter {
 
 #[pyclass]
 pub struct PyRouter {
-    pub inner: RustRouter,
+    pub inner: Arc<RwLock<RustRouter>>,
 }
 
 #[pymethods]
@@ -92,11 +98,14 @@ impl PyRouter {
     #[new]
     fn new() -> Self {
         PyRouter {
-            inner: RustRouter::new(),
+            inner: Arc::new(RwLock::new(RustRouter::new())),
         }
     }
 
     fn add_route(&mut self, method: String, path: String, handler: Py<PyAny>) -> PyResult<()> {
-        self.inner.add_route(method, path, handler)
+        self.inner
+            .write()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?
+            .add_route(method, path, handler)
     }
 }

@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use crossbeam_channel::Sender;
 use pyo3::{exceptions::PyConnectionError, Python};
@@ -27,7 +30,7 @@ pub enum WorkerMode {
     },
     Http {
         cmd_tx: Sender<Command>,
-        router: Arc<RustRouter>,
+        router: Arc<RwLock<RustRouter>>,
     },
 }
 
@@ -103,7 +106,7 @@ async fn default_worker(
 
 async fn http_worker(
     mut stream: TokioStream,
-    router: Arc<RustRouter>,
+    router_lock: Arc<RwLock<RustRouter>>,
     cmd_tx: Sender<Command>,
 ) {
     let mut buf = vec![0u8; 8192];
@@ -116,7 +119,6 @@ async fn http_worker(
             Err(_) => break,
         };
         buffered_bytes += n;
-
         let (parse_res, header_len) = {
             let mut headers = [httparse::EMPTY_HEADER; 64];
             let mut req = httparse::Request::new(&mut headers);
@@ -124,6 +126,14 @@ async fn http_worker(
                 Ok(httparse::Status::Complete(res)) => {
                     let method = req.method.unwrap_or("GET").to_string();
                     let route = req.path.unwrap_or("/").to_string();
+                    if route == "/test_raw" {
+                        let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK";
+
+                        if stream.write_all(response).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     let header_map: HashMap<String, String> = req
                         .headers
                         .iter()
@@ -140,28 +150,28 @@ async fn http_worker(
                 Err(_) => (None, 0),
             }
         };
-
         if let Some((method, route, headers)) = parse_res {
-            let parsed = match parse_url(route.clone()) {
-                Ok(r) => r,
-                Err(_) => break,
+            let body = buf[header_len..buffered_bytes].to_vec();
+            let match_route = {
+                let router = router_lock.read().unwrap();
+                router.find_route(&method, &route)
             };
 
-            let body = buf[header_len..buffered_bytes].to_vec();
-
-            match router.find_route(&method, &route) {
-                RouteMatch::Found { handler_id, .. } => {
-                    let handler = router.get_handler(handler_id).unwrap();
-                    let handler_owned = Python::attach(|py| {
-                        handler.clone_ref(py)
-                    });
+            match match_route {
+                RouteMatch::Found { handler_id, params } => {
+                    let handler_owned = {
+                        let router = router_lock.read().unwrap();
+                        let handler = router.get_handler(handler_id).unwrap();
+                        let x = Python::attach(|py| handler.clone_ref(py));
+                        x
+                    };
                     let (res_tx, mut res_rx) = tokio::sync::mpsc::channel(1);
 
                     let cmd = Command::ExecuteHttp {
                         handler: handler_owned,
                         method,
-                        path: parsed.path,
-                        query: parsed.query,
+                        path: route,
+                        query: params,
                         body,
                         response_tx: res_tx,
                         headers,
@@ -177,7 +187,9 @@ async fn http_worker(
                     let _ = stream.write_all(&helpers::format_404_error()).await;
                 }
                 RouteMatch::MethodNotAllowed { allowed_methods } => {
-                    let _ = stream.write_all(&helpers::format_405_error(&allowed_methods)).await;
+                    let _ = stream
+                        .write_all(&helpers::format_405_error(&allowed_methods))
+                        .await;
                 }
             }
 
@@ -188,7 +200,9 @@ async fn http_worker(
                 buffered_bytes = 0;
             }
         } else if buffered_bytes >= buf.len() {
-            let _ = stream.write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n").await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n")
+                .await;
             break;
         }
     }

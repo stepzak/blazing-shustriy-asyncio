@@ -6,18 +6,23 @@ use tokio::{
     sync::mpsc,
 };
 
-use crate::core::{net::PyTcpStream, task::TaskId};
+use crate::core::{
+    net::{ListenerMode, PyTcpStream},
+    task::TaskId,
+};
 
 pub enum IoResult {
     Bind {
         listener_id: usize,
         listener: TokioListener,
         addr: SocketAddr,
+        mode: ListenerMode,
     },
     Accept {
         stream_id: usize,
         stream: TokioStream,
         addr: SocketAddr,
+        mode: ListenerMode,
     },
     Connect {
         stream_id: usize,
