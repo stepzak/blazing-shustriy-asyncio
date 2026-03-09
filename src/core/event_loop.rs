@@ -1,4 +1,5 @@
 use crossbeam_channel::{self as cb, Receiver, Sender};
+use parking_lot::Mutex;
 use pyo3::{
     exceptions::{PyConnectionError, PyRuntimeError},
     prelude::*,
@@ -10,10 +11,9 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     iter,
     net::SocketAddr,
-    sync::{Arc},
+    sync::Arc,
     time::{Duration, Instant},
 };
-use parking_lot::Mutex;
 use tokio::{
     net::{TcpListener as TokioListener, TcpStream as TokioStream},
     runtime::Runtime,
@@ -32,7 +32,7 @@ use crate::{
         task::{RustTask, StepResult, TaskId},
     },
     http::{
-        helpers::{convert_to_response},
+        helpers::convert_to_response,
         request::BlazingRequest,
         router::{PyRouter, RustRouter},
     },
@@ -133,7 +133,7 @@ impl EventLoop {
             .unwrap()
             .unbind();
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
+            .worker_threads(2)
             .enable_all()
             .build()
             .unwrap();
@@ -772,13 +772,13 @@ impl EventLoop {
                 arc_router,
                 method,
                 path,
-                headers,
+                raw_headers,
                 query,
                 body,
                 response_tx,
             } => {
                 let handler = arc_router.get_handler(handler_id).unwrap().clone_ref(py);
-                let pyreq = BlazingRequest::new(method, path, query, headers, body);
+                let pyreq = BlazingRequest::new(method, path, query, body, raw_headers);
                 let shared_tx = Arc::new(Mutex::new(Some(response_tx)));
                 let gen = match handler.call1(py, (pyreq,)) {
                     Ok(x) => x,

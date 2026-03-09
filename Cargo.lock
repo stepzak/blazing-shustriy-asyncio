@@ -17,14 +17,12 @@ dependencies = [
  "ctrlc",
  "httparse",
  "itoa",
- "lockfree-object-pool",
  "matchit",
  "mimalloc",
  "mio",
  "num_cpus",
  "parking_lot",
  "pyo3",
- "pythonize",
  "serde",
  "serde_json",
  "socket2",
@@ -170,12 +168,6 @@ checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
 ]
-
-[[package]]
-name = "lockfree-object-pool"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9374ef4228402d4b7e403e5838cb880d9ee663314b0a900d5a6aabf0c213552e"
 
 [[package]]
 name = "log"
@@ -359,17 +351,6 @@ dependencies = [
  "pyo3-build-config",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "pythonize"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b79f670c9626c8b651c0581011b57b6ba6970bb69faf01a7c4c0cfc81c43f95"
-dependencies = [
- "pyo3",
- "serde",
- "serde_json",
 ]
 
 [[package]]

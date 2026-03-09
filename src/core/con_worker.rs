@@ -8,15 +8,13 @@ use tokio::{
     sync::mpsc,
 };
 
-
-
 use crate::{
     core::{
         commands::Command,
         io_enums::{IoResult, WorkerCommand},
     },
     http::{
-        helpers::{self, format_500_error, format_http_response},
+        helpers::{self},
         router::{RouteMatch, RustRouter},
     },
 };
@@ -96,88 +94,93 @@ async fn http_worker(
 
     loop {
         let n = match stream.read(&mut buf[buffered_bytes..]).await {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(n) => n,
-            Err(_) => break,
         };
         buffered_bytes += n;
-        let (parse_res, header_len) = {
+
+        loop {
             let mut headers = [httparse::EMPTY_HEADER; 64];
             let mut req = httparse::Request::new(&mut headers);
-            match req.parse(&buf[..buffered_bytes]) {
-                Ok(httparse::Status::Complete(res)) => {
-                    let method = req.method.unwrap_or("GET");
-                    let route = req.path.unwrap_or("/");
-                    if route == "/test_raw" {
-                        let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK";
 
-                        if stream.write_all(response).await.is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-                    let header_list: Vec<(String, String)> = req
-                        .headers
-                        .iter()
-                        .map(|h| {
-                            (
-                                h.name.to_string(),
-                                String::from_utf8_lossy(h.value).into_owned(),
-                            )
-                        })
-                        .collect();
-                    (Some((method, route, header_list)), res)
+            let header_len = match req.parse(&buf[..buffered_bytes]) {
+                Ok(httparse::Status::Complete(len)) => len,
+                Ok(httparse::Status::Partial) => break,
+                Err(_) => {
+                    buffered_bytes = 0;
+                    break;
                 }
-                Ok(httparse::Status::Partial) => (None, 0),
-                Err(_) => (None, 0),
-            }
-        };
-        if let Some((method, route, headers)) = parse_res {
-            let body = buf[header_len..buffered_bytes].to_vec();
-            let match_route = router_lock.find_route(&method, &route);
+            };
 
-            match match_route {
+            let mut body_len = 0;
+            for h in req.headers.iter() {
+                if h.name.eq_ignore_ascii_case("content-length") {
+                    if let Ok(s) = std::str::from_utf8(h.value) {
+                        body_len = s.parse::<usize>().unwrap_or(0);
+                    }
+                }
+            }
+
+            let total_len = header_len + body_len;
+            if buffered_bytes < total_len {
+                break;
+            }
+
+            let method = req.method.unwrap_or("GET");
+            let route = req.path.unwrap_or("/");
+            let raw_headers = buf[..header_len].to_vec();
+            let body = buf[header_len..total_len].to_vec();
+
+            match router_lock.find_route(method, route) {
                 RouteMatch::Found { handler_id, params } => {
                     let (res_tx, res_rx) = tokio::sync::oneshot::channel();
 
                     let cmd = Command::ExecuteHttp {
                         handler_id,
                         arc_router: router_lock.clone(),
-                        method: method.to_string(),
-                        path: route.to_string(),
+                        method: method.to_owned(),
+                        path: route.to_owned(),
                         query: params,
                         body,
                         response_tx: res_tx,
-                        headers,
+                        raw_headers,
                     };
 
                     if cmd_tx.send(cmd).is_ok() {
-                        if let Ok(result) = res_rx.await {
-                            let resp_bytes = match result {
-                                Ok(res) => format_http_response(&res),
-                                Err(_) => format_500_error(),
-                            };
-                            let _ = stream.write_all(&resp_bytes).await;
+                        if let Ok(Ok(res)) = res_rx.await {
+                            let out_buf = helpers::format_http_response(&res);
+                            if stream.write_all(&out_buf).await.is_err() {
+                                break;
+                            }
+                        }
+                        else {
+                            let out_buf = helpers::format_500_error();
+                            if stream.write_all(&out_buf).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
                 RouteMatch::NotFound => {
-                    let _ = stream.write_all(&helpers::format_404_error()).await;
+                    let out_buf = helpers::format_404_error();
+                    let _ = stream.write_all(&out_buf).await;
                 }
                 RouteMatch::MethodNotAllowed { allowed_methods } => {
-                    let _ = stream
-                        .write_all(&helpers::format_405_error(&allowed_methods))
-                        .await;
+                    let out_buf = helpers::format_405_error(&allowed_methods);
+                    let _ = stream.write_all(&out_buf).await;
                 }
             }
 
-            if header_len < buffered_bytes {
-                buf.copy_within(header_len..buffered_bytes, 0);
-                buffered_bytes -= header_len;
+            if total_len < buffered_bytes {
+                buf.copy_within(total_len..buffered_bytes, 0);
+                buffered_bytes -= total_len;
             } else {
                 buffered_bytes = 0;
+                break;
             }
-        } else if buffered_bytes >= buf.len() {
+        }
+
+        if buffered_bytes >= buf.len() {
             let _ = stream
                 .write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n")
                 .await;

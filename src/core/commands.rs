@@ -18,7 +18,7 @@ pub enum Command {
         arc_router: Arc<RustRouter>,
         method: String,
         path: String,
-        headers: Vec<(String, String)>,
+        raw_headers: Vec<u8>,
         query: HashMap<String, String>,
         body: Vec<u8>,
         response_tx: oneshot::Sender<Result<BlazingResponse, ()>>,
