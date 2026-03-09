@@ -766,7 +766,8 @@ impl EventLoop {
                 self.schedule_task(id);
             }
             Command::ExecuteHttp {
-                handler,
+                handler_id,
+                arc_router,
                 method,
                 path,
                 headers,
@@ -774,6 +775,7 @@ impl EventLoop {
                 body,
                 response_tx,
             } => {
+                let handler = arc_router.get_handler(handler_id).unwrap().clone_ref(py);
                 let pyreq = BlazingRequest::new(method, path, query, headers, body);
                 let gen = match handler.call1(py, (pyreq,)) {
                     Ok(x) => x,

@@ -4,7 +4,6 @@ use pyo3::{
 };
 use pythonize::depythonize;
 use serde_json::Value;
-use std::collections::HashMap;
 
 #[pyclass(from_py_object)]
 #[derive(Clone)]
@@ -16,13 +15,13 @@ pub struct BlazingResponse {
     pub body: Option<Vec<u8>>,
 
     #[pyo3(get, set)]
-    pub headers: HashMap<String, String>,
+    pub headers: Vec<(String, String)>,
 }
 
 #[pymethods]
 impl BlazingResponse {
     #[new]
-    pub fn new(status_code: u16, body: Option<Vec<u8>>, headers: HashMap<String, String>) -> Self {
+    pub fn new(status_code: u16, body: Option<Vec<u8>>, headers: Vec<(String, String)>) -> Self {
         BlazingResponse {
             status_code,
             body,
@@ -33,7 +32,7 @@ impl BlazingResponse {
     #[staticmethod]
     pub fn json(
         status_code: u16,
-        headers: Option<HashMap<String, String>>,
+        headers: Option<Vec<(String, String)>>,
         data: &Bound<'_, PyAny>,
     ) -> PyResult<Self> {
         let body_bytes = if data.is_instance_of::<pyo3::types::PyBytes>() {
@@ -53,10 +52,16 @@ impl BlazingResponse {
             data.str()?.extract::<String>()?.into_bytes()
         };
 
-        let mut res_headers = headers.unwrap_or_default();
-        res_headers
-            .entry("Content-Type".to_string())
-            .or_insert("application/json".to_string());
+        let mut res_headers = headers.unwrap_or(Vec::with_capacity(2));
+
+        let has_ctype = res_headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("Content-Type"));
+
+        if !has_ctype {
+            res_headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        }
+
         Ok(BlazingResponse {
             status_code,
             body: Some(body_bytes),

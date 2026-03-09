@@ -14,7 +14,7 @@ pub struct BlazingRequest {
     pub query: HashMap<String, String>,
 
     #[pyo3(get)]
-    pub headers: HashMap<String, String>,
+    pub headers: Vec<(String, String)>,
 
     #[pyo3(get)]
     pub body: Vec<u8>,
@@ -27,7 +27,7 @@ impl BlazingRequest {
         method: String,
         route: String,
         query: HashMap<String, String>,
-        headers: HashMap<String, String>,
+        headers: Vec<(String, String)>,
         body: Vec<u8>,
     ) -> Self {
         BlazingRequest {
@@ -37,10 +37,5 @@ impl BlazingRequest {
             headers,
             body,
         }
-    }
-
-    fn get_header(&self, key: &str) -> Option<&String> {
-        let key_lower = key.to_lowercase();
-        self.headers.get(&key_lower)
     }
 }

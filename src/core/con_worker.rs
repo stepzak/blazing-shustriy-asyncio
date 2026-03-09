@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crossbeam_channel::Sender;
-use pyo3::{exceptions::PyConnectionError, Python};
+use pyo3::exceptions::PyConnectionError;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream as TokioStream,
@@ -104,8 +104,8 @@ async fn http_worker(
             let mut req = httparse::Request::new(&mut headers);
             match req.parse(&buf[..buffered_bytes]) {
                 Ok(httparse::Status::Complete(res)) => {
-                    let method = req.method.unwrap_or("GET").to_string();
-                    let route = req.path.unwrap_or("/").to_string();
+                    let method = req.method.unwrap_or("GET");
+                    let route = req.path.unwrap_or("/");
                     if route == "/test_raw" {
                         let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK";
 
@@ -114,17 +114,13 @@ async fn http_worker(
                         }
                         continue;
                     }
-                    let header_map: HashMap<String, String> = req
-                        .headers
-                        .iter()
-                        .map(|h| {
-                            (
-                                h.name.to_string(),
-                                String::from_utf8_lossy(h.value).to_string(),
-                            )
-                        })
-                        .collect();
-                    (Some((method, route, header_map)), res)
+                    let header_list: Vec<(String, String)> = req.headers.iter()
+                    .map(|h| (
+                        h.name.to_string(), 
+                        String::from_utf8_lossy(h.value).into_owned()
+                    ))
+                    .collect();
+                    (Some((method, route, header_list)), res)
                 }
                 Ok(httparse::Status::Partial) => (None, 0),
                 Err(_) => (None, 0),
@@ -136,17 +132,13 @@ async fn http_worker(
 
             match match_route {
                 RouteMatch::Found { handler_id, params } => {
-                    let handler_owned = {
-                        let handler = router_lock.get_handler(handler_id).unwrap();
-                        let x = Python::attach(|py| handler.clone_ref(py));
-                        x
-                    };
                     let (res_tx, mut res_rx) = tokio::sync::mpsc::channel(1);
 
                     let cmd = Command::ExecuteHttp {
-                        handler: handler_owned,
-                        method,
-                        path: route,
+                        handler_id,
+                        arc_router: router_lock.clone(),
+                        method: method.to_string(),
+                        path: route.to_string(),
                         query: params,
                         body,
                         response_tx: res_tx,

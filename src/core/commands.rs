@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
-use crate::core::task::TaskId;
+use crate::{core::task::TaskId, http::router::RustRouter};
+use bytes::Bytes;
 use pyo3::prelude::*;
 use tokio::sync::mpsc;
 
@@ -11,12 +12,13 @@ pub enum Command {
     },
     Stop,
     ExecuteHttp {
-        handler: Py<PyAny>,
+        handler_id: usize,
+        arc_router: Arc<RustRouter>,
         method: String,
         path: String,
-        headers: HashMap<String, String>,
+        headers: Vec<(String, String)>,
         query: HashMap<String, String>,
         body: Vec<u8>,
-        response_tx: mpsc::Sender<Vec<u8>>,
+        response_tx: mpsc::Sender<Bytes>,
     },
 }
