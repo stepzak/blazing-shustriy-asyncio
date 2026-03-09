@@ -10,9 +10,10 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     iter,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc},
     time::{Duration, Instant},
 };
+use parking_lot::Mutex;
 use tokio::{
     net::{TcpListener as TokioListener, TcpStream as TokioStream},
     runtime::Runtime,
@@ -31,7 +32,7 @@ use crate::{
         task::{RustTask, StepResult, TaskId},
     },
     http::{
-        helpers::{convert_to_response, format_500_error, format_http_response},
+        helpers::{convert_to_response},
         request::BlazingRequest,
         router::{PyRouter, RustRouter},
     },
@@ -314,6 +315,7 @@ impl EventLoop {
 
                 socket.bind(&addr.into())?;
                 socket.listen(1024 * 1024)?;
+                socket.set_tcp_nodelay(true)?;
 
                 socket.set_nonblocking(true)?;
 
@@ -777,11 +779,13 @@ impl EventLoop {
             } => {
                 let handler = arc_router.get_handler(handler_id).unwrap().clone_ref(py);
                 let pyreq = BlazingRequest::new(method, path, query, headers, body);
+                let shared_tx = Arc::new(Mutex::new(Some(response_tx)));
                 let gen = match handler.call1(py, (pyreq,)) {
                     Ok(x) => x,
                     Err(_) => {
-                        let raw_http = format_500_error();
-                        let _ = response_tx.blocking_send(raw_http);
+                        if let Some(tx) = shared_tx.lock().take() {
+                            let _ = tx.send(Err(()));
+                        }
                         return Err(PyRuntimeError::new_err(format!(
                             "{} is not a coroutine",
                             handler.getattr(py, "__name__").unwrap().to_string()
@@ -793,22 +797,24 @@ impl EventLoop {
 
                 let bound = gen.bind(py);
                 let fut = self.create_task(bound, py, Some(task_id));
-                let tx_clone = response_tx.clone();
+                let tx_clone = shared_tx.clone();
                 fut.add_callback(
                     move |res: Py<PyAny>| {
-                        Python::attach(|py_| {
+                        Python::attach(move |py_| {
                             let response = convert_to_response(py_, res);
-                            let raw_http = format_http_response(&response);
-                            let _ = tx_clone.blocking_send(raw_http);
+                            if let Some(tx) = tx_clone.lock().take() {
+                                let _ = tx.send(Ok(response));
+                            }
                         })
                     },
                     py,
                 );
-                let tx_clone = response_tx.clone();
+                let tx_clone = shared_tx;
                 fut.add_err_callback(
                     move |_| {
-                        let raw_http = format_500_error();
-                        let _ = tx_clone.blocking_send(raw_http);
+                        if let Some(tx) = tx_clone.lock().take() {
+                            let _ = tx.send(Err(()));
+                        }
                     },
                     py,
                 );

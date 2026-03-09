@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use crossbeam_channel::Sender;
 use pyo3::exceptions::PyConnectionError;
@@ -8,13 +8,15 @@ use tokio::{
     sync::mpsc,
 };
 
+
+
 use crate::{
     core::{
         commands::Command,
         io_enums::{IoResult, WorkerCommand},
     },
     http::{
-        helpers,
+        helpers::{self, format_500_error, format_http_response},
         router::{RouteMatch, RustRouter},
     },
 };
@@ -114,12 +116,16 @@ async fn http_worker(
                         }
                         continue;
                     }
-                    let header_list: Vec<(String, String)> = req.headers.iter()
-                    .map(|h| (
-                        h.name.to_string(), 
-                        String::from_utf8_lossy(h.value).into_owned()
-                    ))
-                    .collect();
+                    let header_list: Vec<(String, String)> = req
+                        .headers
+                        .iter()
+                        .map(|h| {
+                            (
+                                h.name.to_string(),
+                                String::from_utf8_lossy(h.value).into_owned(),
+                            )
+                        })
+                        .collect();
                     (Some((method, route, header_list)), res)
                 }
                 Ok(httparse::Status::Partial) => (None, 0),
@@ -132,7 +138,7 @@ async fn http_worker(
 
             match match_route {
                 RouteMatch::Found { handler_id, params } => {
-                    let (res_tx, mut res_rx) = tokio::sync::mpsc::channel(1);
+                    let (res_tx, res_rx) = tokio::sync::oneshot::channel();
 
                     let cmd = Command::ExecuteHttp {
                         handler_id,
@@ -146,8 +152,12 @@ async fn http_worker(
                     };
 
                     if cmd_tx.send(cmd).is_ok() {
-                        if let Some(x) = res_rx.recv().await {
-                            let _ = stream.write_all(&x).await;
+                        if let Ok(result) = res_rx.await {
+                            let resp_bytes = match result {
+                                Ok(res) => format_http_response(&res),
+                                Err(_) => format_500_error(),
+                            };
+                            let _ = stream.write_all(&resp_bytes).await;
                         }
                     }
                 }

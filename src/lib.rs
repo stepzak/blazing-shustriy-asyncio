@@ -1,6 +1,7 @@
+use mimalloc::MiMalloc;
 use pyo3::prelude::*;
-
-
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 mod core;
 mod http;

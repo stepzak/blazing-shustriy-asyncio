@@ -131,7 +131,7 @@ pub fn convert_to_response(py: Python<'_>, result_obj: Py<PyAny>) -> BlazingResp
     let is_list = bound.is_instance_of::<pyo3::types::PyList>();
 
     if is_dict || is_list {
-        if let Ok(res) = BlazingResponse::json(200, None, &bound) {
+        if let Ok(res) = BlazingResponse::json(py,200, None, &bound) {
             return res;
         }
     }

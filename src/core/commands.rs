@@ -1,9 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{core::task::TaskId, http::router::RustRouter};
-use bytes::Bytes;
+use crate::{
+    core::task::TaskId,
+    http::{response::BlazingResponse, router::RustRouter},
+};
 use pyo3::prelude::*;
-use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 pub enum Command {
     Spawn {
@@ -19,6 +21,6 @@ pub enum Command {
         headers: Vec<(String, String)>,
         query: HashMap<String, String>,
         body: Vec<u8>,
-        response_tx: mpsc::Sender<Bytes>,
+        response_tx: oneshot::Sender<Result<BlazingResponse, ()>>,
     },
 }
