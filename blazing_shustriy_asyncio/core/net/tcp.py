@@ -7,7 +7,7 @@ class TcpListener:
         self._impl = PyTcpListener()
     
     async def bind(self, addr: str):
-        await self._impl.bind(addr)
+        await self._impl.bind(addr, None)
         return self
     
     async def accept(self):

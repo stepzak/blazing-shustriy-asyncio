@@ -9,7 +9,7 @@ __pycache__/
 *.so
 test.py
 server.py
-http_server.py
+test_exc.py
 Dockerfile
 # Distribution / packaging
 .Python

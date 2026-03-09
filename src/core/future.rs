@@ -1,5 +1,6 @@
-use std::{cell::RefCell, sync::Arc};
+use std::{sync::Arc};
 
+use parking_lot::Mutex;
 use pyo3::{
     exceptions::{PyRuntimeError, PyStopIteration},
     prelude::*,
@@ -116,13 +117,13 @@ impl Future {
 
 #[derive(Clone)]
 pub struct RustFuture {
-    inner: Arc<RefCell<Future>>,
+    inner: Arc<Mutex<Future>>,
 }
 
 impl RustFuture {
     pub fn new() -> Self {
         RustFuture {
-            inner: Arc::new(RefCell::new(Future::new())),
+            inner: Arc::new(Mutex::new(Future::new())),
         }
     }
 
@@ -130,30 +131,30 @@ impl RustFuture {
     where
         F: FnOnce(Py<PyAny>) + 'static,
     {
-        self.inner.borrow_mut().add_callback(callback, py);
+        self.inner.lock().add_callback(callback, py);
     }
 
     pub fn add_err_callback<F>(&self, callback: F, py: Python)
     where
         F: FnOnce(PyErr) + 'static,
     {
-        self.inner.borrow_mut().add_err_callback(callback, py);
+        self.inner.lock().add_err_callback(callback, py);
     }
 
     pub fn set_result(&self, res: Py<PyAny>, py: Python) -> PyResult<()> {
-        self.inner.borrow_mut().set_result(res, py)
+        self.inner.lock().set_result(res, py)
     }
 
     pub fn set_exception(&self, exc: PyErr, py: Python) -> PyResult<()> {
-        self.inner.borrow_mut().set_exception(exc, py)
+        self.inner.lock().set_exception(exc, py)
     }
 
     pub fn is_done(&self) -> bool {
-        self.inner.borrow().is_done()
+        self.inner.lock().is_done()
     }
 
     pub fn result(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-        self.inner.borrow().result(py)
+        self.inner.lock().result(py)
     }
 }
 

@@ -250,7 +250,8 @@ impl EventLoop {
             }
             StepResult::Failure(err) => {
                 if let Some(entry) = self.tasks_hm.remove(&id) {
-                    entry.future.set_exception(err, py)?;
+                    entry.future.set_exception(err.clone_ref(py), py)?;
+                    return Err(err);
                 }
             }
         }
@@ -867,11 +868,12 @@ impl EventLoop {
             }
 
             if !had_events {
+                py.check_signals()?;
                 let sleep_duration = match self.next_timer {
                     Some(when) => {
                         let now = Instant::now();
                         if when > now {
-                            let duration = when - now;
+                            let duration = (when - now).min(Duration::from_millis(5));
                             if !self.pending_io.is_empty() {
                                 Some(std::cmp::min(duration, Duration::from_micros(100)))
                             } else {
@@ -889,14 +891,11 @@ impl EventLoop {
                         }
                     }
                 };
-
                 if let Some(duration) = sleep_duration {
                     py.detach(|| std::thread::sleep(duration));
                     continue;
                 }
             }
-
-            py.check_signals()?;
         }
 
         self.shutdown();

@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 use pyo3::{exceptions::PyStopIteration, prelude::*};
 use std::{cell::RefCell, sync::Arc};
 
@@ -28,8 +29,8 @@ impl Task {
         F: FnOnce(&Bound<'_, PyAny>) -> PyResult<Py<PyAny>>,
     {
         let coro = self.coro.bind(py);
-
-        match method(coro) {
+        let r = method(coro);
+        match r {
             Ok(res) => StepResult::Yield(res),
             Err(e) => {
                 if e.is_instance_of::<PyStopIteration>(py) {
@@ -75,21 +76,21 @@ impl Task {
 
 #[derive(Clone)]
 pub struct RustTask {
-    inner: Arc<RefCell<Task>>,
+    inner: Arc<Mutex<Task>>,
 }
 
 impl RustTask {
     pub fn new(coro: &Bound<'_, PyAny>) -> Self {
         RustTask {
-            inner: Arc::new(RefCell::new(Task::new(coro))),
+            inner: Arc::new(Mutex::new(Task::new(coro))),
         }
     }
 
     pub fn step(&self, val: Option<Py<PyAny>>, py: Python) -> StepResult {
-        self.inner.borrow().step(val, py)
+        self.inner.lock().step(val, py)
     }
 
     pub fn throw(&self, err: PyErr, py: Python) -> StepResult {
-        self.inner.borrow().throw(err, py)
+        self.inner.lock().throw(err, py)
     }
 }
