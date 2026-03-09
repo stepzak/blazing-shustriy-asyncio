@@ -10,7 +10,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     iter,
     net::SocketAddr,
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -33,7 +33,7 @@ use crate::{
     http::{
         helpers::{convert_to_response, format_500_error, format_http_response},
         request::BlazingRequest,
-        router::RustRouter,
+        router::{PyRouter, RustRouter},
     },
 };
 
@@ -132,9 +132,8 @@ impl EventLoop {
             .unwrap()
             .unbind();
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(num_cpus::get())
+            .worker_threads(4)
             .enable_all()
-            .thread_name("blazing-worker")
             .build()
             .unwrap();
         Ok(EventLoop {
@@ -287,7 +286,7 @@ impl EventLoop {
         id: TaskId,
         addr: SocketAddr,
         pyclass: Py<PyTcpListener>,
-        router: Option<Arc<RwLock<RustRouter>>>,
+        router: Option<Arc<RustRouter>>,
     ) -> PyResult<()> {
         let mut mode = ListenerMode::Raw;
         if let Some(r) = router {
@@ -314,7 +313,7 @@ impl EventLoop {
                 socket.set_reuse_port(true)?;
 
                 socket.bind(&addr.into())?;
-                socket.listen(1024)?;
+                socket.listen(1024 * 1024)?;
 
                 socket.set_nonblocking(true)?;
 
@@ -472,8 +471,9 @@ impl EventLoop {
             let pyroute = binded.router.as_ref();
             let mut router = None;
             if let Some(r) = pyroute {
-                let bound = r.bind(py).borrow();
-                router = Some(bound.inner.clone());
+                let bound = r.bind(py);
+                let arc = PyRouter::get_router_arc(&bound)?;
+                router = Some(arc);
             }
             return self.handle_bind(id, binded.addr, binded.pyclass.clone_ref(py), router);
         }

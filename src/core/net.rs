@@ -3,17 +3,14 @@ use pyo3::{
     prelude::*,
     IntoPyObjectExt,
 };
-use std::{
-    net::SocketAddr,
-    sync::{Arc, RwLock},
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use crate::http::router::{PyRouter, RustRouter};
 
 #[derive(Clone)]
 pub enum ListenerMode {
     Raw,
-    Http(Arc<RwLock<RustRouter>>),
+    Http(Arc<RustRouter>),
 }
 
 macro_rules! impl_generator {

@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
+use std::{collections::HashMap, sync::Arc};
 
 use crossbeam_channel::Sender;
 use pyo3::{exceptions::PyConnectionError, Python};
@@ -10,7 +7,6 @@ use tokio::{
     net::TcpStream as TokioStream,
     sync::mpsc,
 };
-use url::Url;
 
 use crate::{
     core::{
@@ -30,7 +26,7 @@ pub enum WorkerMode {
     },
     Http {
         cmd_tx: Sender<Command>,
-        router: Arc<RwLock<RustRouter>>,
+        router: Arc<RustRouter>,
     },
 }
 
@@ -39,22 +35,6 @@ pub async fn connection_worker(mode: WorkerMode, stream: TokioStream) {
         WorkerMode::Default { cmd_rx, io_tx } => default_worker(stream, cmd_rx, io_tx).await,
         WorkerMode::Http { cmd_tx, router } => http_worker(stream, router, cmd_tx).await,
     };
-}
-
-struct Route {
-    path: String,
-    query: HashMap<String, String>,
-}
-
-fn parse_url(url: String) -> Result<Route, url::ParseError> {
-    let parsed_url = Url::parse(&url)?;
-    Ok(Route {
-        path: parsed_url.path().to_string(),
-        query: parsed_url
-            .query_pairs()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
-    })
 }
 
 async fn default_worker(
@@ -106,7 +86,7 @@ async fn default_worker(
 
 async fn http_worker(
     mut stream: TokioStream,
-    router_lock: Arc<RwLock<RustRouter>>,
+    router_lock: Arc<RustRouter>,
     cmd_tx: Sender<Command>,
 ) {
     let mut buf = vec![0u8; 8192];
@@ -152,16 +132,12 @@ async fn http_worker(
         };
         if let Some((method, route, headers)) = parse_res {
             let body = buf[header_len..buffered_bytes].to_vec();
-            let match_route = {
-                let router = router_lock.read().unwrap();
-                router.find_route(&method, &route)
-            };
+            let match_route = router_lock.find_route(&method, &route);
 
             match match_route {
                 RouteMatch::Found { handler_id, params } => {
                     let handler_owned = {
-                        let router = router_lock.read().unwrap();
-                        let handler = router.get_handler(handler_id).unwrap();
+                        let handler = router_lock.get_handler(handler_id).unwrap();
                         let x = Python::attach(|py| handler.clone_ref(py));
                         x
                     };

@@ -19,6 +19,7 @@ pub enum RouteMatch {
     },
 }
 
+#[derive(Debug)]
 pub struct RustRouter {
     pub routers: HashMap<String, MatchitRouter<usize>>,
     pub handlers_registry: Vec<Py<PyAny>>,
@@ -90,7 +91,24 @@ impl RustRouter {
 
 #[pyclass]
 pub struct PyRouter {
-    pub inner: Arc<RwLock<RustRouter>>,
+    pub inner: Option<Arc<RwLock<RustRouter>>>,
+    pub frozen: Option<Arc<RustRouter>>,
+}
+
+impl PyRouter {
+    pub fn get_router_arc(slf: &Bound<'_, Self>) -> PyResult<Arc<RustRouter>> {
+        let router_ref = slf.borrow();
+
+        if let Some(frozen_arc) = &router_ref.frozen {
+            Ok(Arc::clone(frozen_arc))
+        } else if router_ref.inner.is_some() {
+            Err(PyRuntimeError::new_err(
+                "Router is not frozen! Call app._router.freeze() before starting the server.",
+            ))
+        } else {
+            Err(PyRuntimeError::new_err("Router is in invalid state"))
+        }
+    }
 }
 
 #[pymethods]
@@ -98,14 +116,34 @@ impl PyRouter {
     #[new]
     fn new() -> Self {
         PyRouter {
-            inner: Arc::new(RwLock::new(RustRouter::new())),
+            inner: Some(Arc::new(RwLock::new(RustRouter::new()))),
+            frozen: None,
         }
     }
 
-    fn add_route(&mut self, method: String, path: String, handler: Py<PyAny>) -> PyResult<()> {
-        self.inner
-            .write()
-            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?
-            .add_route(method, path, handler)
+    fn add_route(&self, method: String, path: String, handler: Py<PyAny>) -> PyResult<()> {
+        match &self.inner {
+            Some(x) => x
+                .write()
+                .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?
+                .add_route(method, path, handler),
+            None => Err(PyRuntimeError::new_err("Router is frozen")),
+        }
+    }
+
+    fn freeze(&mut self) -> PyResult<()> {
+        if let Some(_) = self.frozen {
+            return Ok(());
+        }
+        if let Some(inner) = self.inner.take() {
+            let rwlock = Arc::try_unwrap(inner).map_err(|_| {
+                PyRuntimeError::new_err("Cannot freeze: router is still in use by another thread")
+            })?;
+            let r = rwlock
+                .into_inner()
+                .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+            self.frozen = Some(Arc::new(r));
+        }
+        Ok(())
     }
 }

@@ -21,4 +21,3 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 socket2 = { version = "0.6.2", features = ["all"] }
 tokio = { version = "1.49.0", features = ["full", "mio", "net", "socket2"] }
-url = "2.5.8"
