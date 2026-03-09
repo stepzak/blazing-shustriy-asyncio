@@ -37,10 +37,8 @@ class BlazingApp:
 
         loop = _rc.PyEventLoop()
         listener = _rc.PyTcpListener()
-        print("Worker started")
         async def start_server():
             await listener.bind(f"{host}:{port}", router=self._router)
-            print("Bound")
             while True:
                 await listener.accept()
         try:
