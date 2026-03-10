@@ -4,13 +4,17 @@ use crate::{
     core::task::TaskId,
     http::{response::BlazingResponse, router::RustRouter},
 };
-use pyo3::prelude::*;
+use pyo3::{prelude::*, types::PyTuple};
 use tokio::sync::oneshot;
 
 pub enum Command {
     Spawn {
         coro: Py<PyAny>,
         id: TaskId,
+    },
+    CallSoon {
+        callback: Py<PyAny>,
+        args: Py<PyTuple>
     },
     Stop,
     ExecuteHttp {

@@ -106,6 +106,7 @@ struct EventLoop {
     pending_streams: HashMap<usize, Py<PyTcpStream>>,
     next_stream_id: usize,
     connection_workers: HashMap<usize, ConnectionWorker>,
+    callbacks: VecDeque<(Py<PyAny>, Py<PyTuple>)>
 }
 
 impl EventLoop {
@@ -160,6 +161,7 @@ impl EventLoop {
             next_listener_id: 0,
             pending_streams: HashMap::new(),
             connection_workers: HashMap::new(),
+            callbacks: VecDeque::with_capacity(1024)
         })
     }
 
@@ -768,6 +770,9 @@ impl EventLoop {
                 self.create_task(gen_bound, py, Some(id));
                 self.schedule_task(id);
             }
+            Command::CallSoon { callback, args } => {
+                self.callbacks.push_back((callback, args));
+            }
             Command::ExecuteHttp {
                 handler_id,
                 arc_router,
@@ -832,6 +837,12 @@ impl EventLoop {
     fn run_forever(&mut self, py: Python) -> PyResult<()> {
         loop {
             let mut had_events = false;
+
+            while let Some((cb, args)) = self.callbacks.pop_front() {
+                if let Err(e) = cb.call1(py, (args,)) {
+                    e.print(py);
+                }
+            }
 
             while let Ok((id, res_result)) = self.wake_rx.try_recv() {
                 had_events = true;
@@ -950,6 +961,13 @@ impl RustEventLoop {
         self.event_loop.borrow_mut().create_task(gen, py, None)
     }
 
+    pub fn call_soon(&self, callback: Py<PyAny>, args: Py<PyTuple>) -> PyResult<()> {
+        self.cmd_tx.send(
+            Command::CallSoon { callback, args }
+        ).map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
+        Ok(())
+    }
+
     pub fn spawn(&self, gen: &Bound<'_, PyAny>) -> PyResult<usize> {
         let unbound = gen.clone().unbind();
         let mut loop_ref = self.event_loop.borrow_mut();
@@ -999,6 +1017,10 @@ impl PyEventLoop {
         let py = slf.py();
         let fut = slf.borrow().loop_impl.create_task(gen, py);
         Ok(Py::new(py, PyFuture { future: fut })?.into_any())
+    }
+
+    fn call_soon(&self, callback: Py<PyAny>, args: Py<PyTuple>) -> PyResult<()> {
+        self.loop_impl.call_soon(callback, args)
     }
 
     fn spawn(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<()> {
