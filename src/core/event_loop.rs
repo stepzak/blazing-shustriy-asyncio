@@ -87,6 +87,20 @@ struct ListenerEntry {
 struct Callback {
     func: Py<PyAny>,
     args: Py<PyTuple>,
+    context: Option<Py<PyAny>>
+}
+
+impl Callback {
+    fn call(&self, py: Python) -> PyResult<()> {
+        if let Some(ctx) = &self.context {
+            ctx.call_method1(py, "run", (self.func.clone_ref(py), self.args.clone_ref(py),))?;
+            return Ok(())
+        }
+        else {
+            self.func.call1(py, (self.args.clone_ref(py),))?;
+            return Ok(())
+        }
+    }
 }
 
 struct ScheduledCallback {
@@ -812,22 +826,25 @@ impl EventLoop {
                 self.create_task(gen_bound, py, Some(id))?;
                 self.schedule_task(id);
             }
-            Command::CallSoon { callback, args } => {
+            Command::CallSoon { callback, args, context } => {
                 self.callbacks.push_back(Callback {
                     func: callback,
                     args,
+                    context
                 });
             }
             Command::CallLater {
                 when,
                 callback,
                 args,
+                context
             } => {
                 self.scheduled_callbacks.push(ScheduledCallback {
                     when,
                     callback: Callback {
                         func: callback,
                         args,
+                        context
                     },
                 });
             }
@@ -905,7 +922,7 @@ impl EventLoop {
                 }
             }
             while let Some(cb) = self.callbacks.pop_front() {
-                if let Err(e) = cb.func.call1(py, (cb.args,)) {
+                if let Err(e) = cb.call(py) {
                     e.print(py);
                 }
             }
@@ -1027,19 +1044,20 @@ impl RustEventLoop {
         self.event_loop.borrow_mut().create_task(gen, py, None)
     }
 
-    pub fn call_soon(&self, callback: Py<PyAny>, args: Py<PyTuple>) -> PyResult<()> {
+    pub fn call_soon(&self, callback: Py<PyAny>, args: Py<PyTuple>, context: Option<Py<PyAny>>) -> PyResult<()> {
         self.cmd_tx
-            .send(Command::CallSoon { callback, args })
+            .send(Command::CallSoon { callback, args, context })
             .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
         Ok(())
     }
 
-    pub fn call_later(&self, delay: f64, callback: Py<PyAny>, args: Py<PyTuple>) -> PyResult<()> {
+    pub fn call_later(&self, delay: f64, callback: Py<PyAny>, args: Py<PyTuple>, context: Option<Py<PyAny>>) -> PyResult<()> {
         self.cmd_tx
             .send(Command::CallLater {
                 when: Instant::now() + Duration::from_secs_f64(delay),
                 callback,
                 args,
+                context
             })
             .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
         Ok(())
@@ -1096,12 +1114,12 @@ impl PyEventLoop {
         Ok(Py::new(py, PyFuture { future: fut })?.into_any())
     }
 
-    fn call_soon(&self, callback: Py<PyAny>, args: Py<PyTuple>) -> PyResult<()> {
-        self.loop_impl.call_soon(callback, args)
+    fn call_soon(&self, callback: Py<PyAny>, args: Py<PyTuple>, context: Option<Py<PyAny>>) -> PyResult<()> {
+        self.loop_impl.call_soon(callback, args, context)
     }
 
-    fn call_later(&self, delay: f64, callback: Py<PyAny>, args: Py<PyTuple>) -> PyResult<()> {
-        self.loop_impl.call_later(delay, callback, args)
+    fn call_later(&self, delay: f64, callback: Py<PyAny>, args: Py<PyTuple>, context: Option<Py<PyAny>>) -> PyResult<()> {
+        self.loop_impl.call_later(delay, callback, args, context)
     }
 
     fn spawn(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<()> {

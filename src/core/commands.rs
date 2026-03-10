@@ -15,11 +15,13 @@ pub enum Command {
     CallSoon {
         callback: Py<PyAny>,
         args: Py<PyTuple>,
+        context: Option<Py<PyAny>>
     },
     CallLater {
         when: Instant,
         callback: Py<PyAny>,
         args: Py<PyTuple>,
+        context: Option<Py<PyAny>>
     },
     Stop,
     ExecuteHttp {
