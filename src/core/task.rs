@@ -1,11 +1,13 @@
 use parking_lot::Mutex;
 use pyo3::{exceptions::PyStopIteration, prelude::*};
-use std::{cell::RefCell, sync::Arc};
+use std::sync::Arc;
 
 pub type TaskId = usize;
 
 struct Task {
-    coro: Py<PyAny>,
+    context: Py<PyAny>,
+    send_method: Py<PyAny>,
+    throw_method: Py<PyAny>,
 }
 
 pub enum StepResult {
@@ -15,21 +17,22 @@ pub enum StepResult {
 }
 
 impl Task {
-    fn new(coro: &Bound<'_, PyAny>) -> Self {
-        if !coro.hasattr("send").unwrap_or(false) {
-            panic!("Function must be a generator");
-        }
+    fn new(coro: &Bound<'_, PyAny>, context: Py<PyAny>) -> Self {
+        let send = coro.getattr("send").expect("Not a generator");
+        let throw = coro.getattr("throw").expect("Not a generator");
+
         Task {
-            coro: coro.clone().unbind(),
+            context,
+            send_method: send.unbind(),
+            throw_method: throw.unbind(),
         }
     }
 
     fn call_method<F>(&self, method: F, py: Python) -> StepResult
     where
-        F: FnOnce(&Bound<'_, PyAny>) -> PyResult<Py<PyAny>>,
+        F: FnOnce() -> PyResult<Py<PyAny>>,
     {
-        let coro = self.coro.bind(py);
-        let r = method(coro);
+        let r = method();
         match r {
             Ok(res) => StepResult::Yield(res),
             Err(e) => {
@@ -51,9 +54,11 @@ impl Task {
 
     fn throw(&self, err: PyErr, py: Python) -> StepResult {
         self.call_method(
-            |coro| {
-                let throw_method = coro.getattr("throw")?;
-                Ok(throw_method.call1((err.value(py),))?.into())
+            || {
+                let result =
+                    self.context
+                        .call_method1(py, "run", (self.throw_method.clone_ref(py), err))?;
+                Ok(result)
             },
             py,
         )
@@ -61,16 +66,66 @@ impl Task {
 
     fn step(&self, val: Option<Py<PyAny>>, py: Python) -> StepResult {
         self.call_method(
-            |coro| {
-                let send_method = coro.getattr("send")?;
+            || {
                 let val_send = match val {
                     Some(x) => x,
                     None => py.None(),
                 };
-                Ok(send_method.call1((val_send,))?.into())
+                let result = self.context.call_method1(
+                    py,
+                    "run",
+                    (self.send_method.clone_ref(py), val_send),
+                )?;
+                Ok(result)
             },
             py,
         )
+    }
+
+    fn step_direct(&self, val: Option<Py<PyAny>>, py: Python) -> StepResult {
+        let val_send = match val {
+            Some(x) => x,
+            None => py.None(),
+        };
+        match self.send_method.call1(py, (val_send,)) {
+            Ok(res) => StepResult::Yield(res),
+            Err(e) => {
+                if e.is_instance_of::<PyStopIteration>(py) {
+                    let exc_value = e.value(py);
+                    let res_obj: Py<PyAny> = exc_value
+                        .getattr("value")
+                        .map(|b| b.into())
+                        .unwrap_or_else(|_| py.None())
+                        .into();
+                    StepResult::Success(res_obj)
+                } else {
+                    StepResult::Failure(e)
+                }
+            }
+        }
+    }
+
+    fn throw_direct(&self, err: PyErr, py: Python) -> StepResult {
+        match self.throw_method.call1(py, (err,)) {
+            Ok(res) => StepResult::Yield(res),
+            Err(e) => {
+                if e.is_instance_of::<PyStopIteration>(py) {
+                    let exc_value = e.value(py);
+                    let res_obj: Py<PyAny> = exc_value
+                        .getattr("value")
+                        .map(|b| b.into())
+                        .unwrap_or_else(|_| py.None())
+                        .into();
+                    StepResult::Success(res_obj)
+                } else {
+                    StepResult::Failure(e)
+                }
+            }
+        }
+    }
+
+    fn needs_context_switch(&self, current_ctx: &Bound<'_, PyAny>, py: Python) -> bool {
+        !self.context.bind(py).is(current_ctx)
     }
 }
 
@@ -80,17 +135,30 @@ pub struct RustTask {
 }
 
 impl RustTask {
-    pub fn new(coro: &Bound<'_, PyAny>) -> Self {
+    pub fn new(coro: &Bound<'_, PyAny>, context: Py<PyAny>) -> Self {
         RustTask {
-            inner: Arc::new(Mutex::new(Task::new(coro))),
+            inner: Arc::new(Mutex::new(Task::new(coro, context))),
         }
     }
 
-    pub fn step(&self, val: Option<Py<PyAny>>, py: Python) -> StepResult {
-        self.inner.lock().step(val, py)
+    pub fn step(&self, val: Option<Py<PyAny>>, direct: bool, py: Python) -> StepResult {
+        if direct {
+            self.inner.lock().step_direct(val, py)
+        } else {
+            self.inner.lock().step(val, py)
+        }
     }
 
-    pub fn throw(&self, err: PyErr, py: Python) -> StepResult {
-        self.inner.lock().throw(err, py)
+    pub fn throw(&self, err: PyErr, direct: bool, py: Python) -> StepResult {
+        if direct {
+            self.inner.lock().throw_direct(err, py)
+        }
+        else {
+            self.inner.lock().throw(err, py)
+        }
+    }
+
+    pub fn needs_context_switch(&self, current_ctx: &Bound<'_, PyAny>, py: Python) -> bool {
+        self.inner.lock().needs_context_switch(current_ctx, py)
     }
 }

@@ -152,8 +152,7 @@ async fn http_worker(
                             if stream.write_all(&out_buf).await.is_err() {
                                 break;
                             }
-                        }
-                        else {
+                        } else {
                             let out_buf = helpers::format_500_error();
                             if stream.write_all(&out_buf).await.is_err() {
                                 break;

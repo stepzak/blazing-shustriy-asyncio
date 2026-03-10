@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use crate::{
     core::task::TaskId,
@@ -14,7 +14,12 @@ pub enum Command {
     },
     CallSoon {
         callback: Py<PyAny>,
-        args: Py<PyTuple>
+        args: Py<PyTuple>,
+    },
+    CallLater {
+        when: Instant,
+        callback: Py<PyAny>,
+        args: Py<PyTuple>,
     },
     Stop,
     ExecuteHttp {

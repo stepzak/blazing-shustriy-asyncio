@@ -8,7 +8,8 @@ use pyo3::{
 };
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    cmp::Ordering,
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque},
     iter,
     net::SocketAddr,
     sync::Arc,
@@ -83,6 +84,36 @@ struct ListenerEntry {
     mode: ListenerMode,
 }
 
+struct Callback {
+    func: Py<PyAny>,
+    args: Py<PyTuple>,
+}
+
+struct ScheduledCallback {
+    when: Instant,
+    callback: Callback,
+}
+
+impl Ord for ScheduledCallback {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.when.cmp(&self.when)
+    }
+}
+
+impl PartialOrd for ScheduledCallback {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ScheduledCallback {
+    fn eq(&self, other: &Self) -> bool {
+        self.when == other.when
+    }
+}
+
+impl Eq for ScheduledCallback {}
+
 struct EventLoop {
     tasks_hm: HashMap<TaskId, TaskEntry>,
     task_deq: VecDeque<TaskId>,
@@ -106,7 +137,9 @@ struct EventLoop {
     pending_streams: HashMap<usize, Py<PyTcpStream>>,
     next_stream_id: usize,
     connection_workers: HashMap<usize, ConnectionWorker>,
-    callbacks: VecDeque<(Py<PyAny>, Py<PyTuple>)>
+    callbacks: VecDeque<Callback>,
+    scheduled_callbacks: BinaryHeap<ScheduledCallback>,
+    copy_context_method: Py<PyAny>,
 }
 
 impl EventLoop {
@@ -122,6 +155,12 @@ impl EventLoop {
         let module = PyModule::import(py, "blazing_shustriy_asyncio")?;
         let sleep_t = module.getattr("_AsyncSleep")?.unbind();
         let gather_t = module.getattr("_AsyncGather")?.unbind();
+        let cv = py
+            .import("contextvars")
+            .expect("Failed to import contextvars");
+        let copy_context = cv
+            .getattr("copy_context")
+            .expect("Failed to get copy_context");
         let future_t = module
             .getattr("PyFuture")
             .ok()
@@ -139,6 +178,7 @@ impl EventLoop {
             .build()
             .unwrap();
         Ok(EventLoop {
+            copy_context_method: copy_context.unbind(),
             tasks_hm: HashMap::with_capacity(1024),
             task_deq: VecDeque::with_capacity(1024),
             timers: BTreeMap::new(),
@@ -161,7 +201,8 @@ impl EventLoop {
             next_listener_id: 0,
             pending_streams: HashMap::new(),
             connection_workers: HashMap::new(),
-            callbacks: VecDeque::with_capacity(1024)
+            callbacks: VecDeque::with_capacity(1024),
+            scheduled_callbacks: BinaryHeap::new(),
         })
     }
 
@@ -200,14 +241,14 @@ impl EventLoop {
         gen: &Bound<'_, PyAny>,
         py: Python,
         t_id: Option<TaskId>,
-    ) -> RustFuture {
+    ) -> PyResult<RustFuture> {
         let coro = if gen.hasattr("__await__").unwrap_or(false) {
             match gen.call_method0("__await__") {
                 Ok(x) => x,
                 Err(exc) => {
                     let fut = RustFuture::new();
                     let _ = fut.set_exception(exc, py);
-                    return fut;
+                    return Ok(fut);
                 }
             }
         } else {
@@ -220,7 +261,8 @@ impl EventLoop {
                 self.next_id - 1
             }
         };
-        let task = RustTask::new(&coro);
+        let context = self.copy_context_method.bind(py).call0()?.unbind();
+        let task = RustTask::new(&coro, context);
         let fut = RustFuture::new();
 
         self.tasks_hm.insert(
@@ -233,7 +275,7 @@ impl EventLoop {
             },
         );
 
-        fut
+        Ok(fut)
     }
 
     fn schedule_task(&mut self, id: TaskId) {
@@ -264,13 +306,14 @@ impl EventLoop {
         if !self.tasks_hm.contains_key(&id) {
             return Ok(());
         }
-
+        let current_ctx = self.copy_context_method.call0(py)?;
+        let current_ctx_bound = current_ctx.bind(py);
         let entry = self.tasks_hm.get_mut(&id).unwrap();
 
+        let needs_switch = entry.task.needs_context_switch(current_ctx_bound, py);
         if let Some(err) = entry.pending_err.take() {
             let step_res = {
-                let task_entry = self.tasks_hm.get(&id).unwrap();
-                task_entry.task.throw(err, py)
+                entry.task.throw(err, !needs_switch, py)
             };
             return self.process_step(id, step_res, py);
         }
@@ -278,8 +321,7 @@ impl EventLoop {
         let pending_val = entry.pending_val.take();
 
         let step_res = {
-            let task_entry = self.tasks_hm.get(&id).unwrap();
-            task_entry.task.step(pending_val, py)
+            entry.task.step(pending_val, !needs_switch, py)
         };
 
         self.process_step(id, step_res, py)
@@ -550,7 +592,7 @@ impl EventLoop {
             }
         }
         if val_binded.hasattr("send").unwrap_or(false) {
-            let child_future = self.create_task(val_binded.cast()?, py, None);
+            let child_future = self.create_task(val_binded.cast()?, py, None)?;
             let child_id = self.next_id - 1;
             self.schedule_task(child_id);
 
@@ -593,7 +635,7 @@ impl EventLoop {
             if !coro.hasattr("send").unwrap_or(false) {
                 return Err(PyRuntimeError::new_err("All args must be generators"));
             }
-            let child_fut = self.create_task(coro.cast()?, py, None);
+            let child_fut = self.create_task(coro.cast()?, py, None)?;
             let child_id = self.next_id - 1;
             self.schedule_task(child_id);
 
@@ -767,11 +809,27 @@ impl EventLoop {
         match cmd {
             Command::Spawn { coro, id } => {
                 let gen_bound = coro.bind(py);
-                self.create_task(gen_bound, py, Some(id));
+                self.create_task(gen_bound, py, Some(id))?;
                 self.schedule_task(id);
             }
             Command::CallSoon { callback, args } => {
-                self.callbacks.push_back((callback, args));
+                self.callbacks.push_back(Callback {
+                    func: callback,
+                    args,
+                });
+            }
+            Command::CallLater {
+                when,
+                callback,
+                args,
+            } => {
+                self.scheduled_callbacks.push(ScheduledCallback {
+                    when,
+                    callback: Callback {
+                        func: callback,
+                        args,
+                    },
+                });
             }
             Command::ExecuteHttp {
                 handler_id,
@@ -802,7 +860,7 @@ impl EventLoop {
                 self.next_id += 1;
 
                 let bound = gen.bind(py);
-                let fut = self.create_task(bound, py, Some(task_id));
+                let fut = self.create_task(bound, py, Some(task_id))?;
                 let tx_clone = shared_tx.clone();
                 fut.add_callback(
                     move |res: Py<PyAny>| {
@@ -837,9 +895,17 @@ impl EventLoop {
     fn run_forever(&mut self, py: Python) -> PyResult<()> {
         loop {
             let mut had_events = false;
-
-            while let Some((cb, args)) = self.callbacks.pop_front() {
-                if let Err(e) = cb.call1(py, (args,)) {
+            let now = Instant::now();
+            while let Some(task) = self.scheduled_callbacks.peek() {
+                if task.when <= now {
+                    let task = self.scheduled_callbacks.pop().unwrap();
+                    self.callbacks.push_back(task.callback);
+                } else {
+                    break;
+                }
+            }
+            while let Some(cb) = self.callbacks.pop_front() {
+                if let Err(e) = cb.func.call1(py, (cb.args,)) {
                     e.print(py);
                 }
             }
@@ -914,7 +980,7 @@ impl EventLoop {
     }
 
     fn run_until_complete(&mut self, coro: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
-        self.create_task(coro, py, None);
+        self.create_task(coro, py, None)?;
         let id = self.next_id - 1;
         self.schedule_task(id);
         self.run_forever(py)
@@ -957,14 +1023,25 @@ impl RustEventLoop {
         })
     }
 
-    pub fn create_task(&self, gen: &Bound<'_, PyAny>, py: Python) -> RustFuture {
+    pub fn create_task(&self, gen: &Bound<'_, PyAny>, py: Python) -> PyResult<RustFuture> {
         self.event_loop.borrow_mut().create_task(gen, py, None)
     }
 
     pub fn call_soon(&self, callback: Py<PyAny>, args: Py<PyTuple>) -> PyResult<()> {
-        self.cmd_tx.send(
-            Command::CallSoon { callback, args }
-        ).map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
+        self.cmd_tx
+            .send(Command::CallSoon { callback, args })
+            .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
+        Ok(())
+    }
+
+    pub fn call_later(&self, delay: f64, callback: Py<PyAny>, args: Py<PyTuple>) -> PyResult<()> {
+        self.cmd_tx
+            .send(Command::CallLater {
+                when: Instant::now() + Duration::from_secs_f64(delay),
+                callback,
+                args,
+            })
+            .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
         Ok(())
     }
 
@@ -1015,12 +1092,16 @@ impl PyEventLoop {
 
     fn create_task(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
-        let fut = slf.borrow().loop_impl.create_task(gen, py);
+        let fut = slf.borrow().loop_impl.create_task(gen, py)?;
         Ok(Py::new(py, PyFuture { future: fut })?.into_any())
     }
 
     fn call_soon(&self, callback: Py<PyAny>, args: Py<PyTuple>) -> PyResult<()> {
         self.loop_impl.call_soon(callback, args)
+    }
+
+    fn call_later(&self, delay: f64, callback: Py<PyAny>, args: Py<PyTuple>) -> PyResult<()> {
+        self.loop_impl.call_later(delay, callback, args)
     }
 
     fn spawn(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<()> {
