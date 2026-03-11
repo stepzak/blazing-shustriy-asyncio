@@ -116,7 +116,12 @@ impl TaskEntry {
     fn cancelled(&self, py: Python) -> bool {
         self.future.borrow(py).future.cancelled()
     }
+}
 
+struct Handle {
+    callback: Py<PyAny>,
+    args: Py<PyTuple>,
+    context: Option<Py<PyAny>>,
 }
 
 struct ListenerEntry {
@@ -126,23 +131,17 @@ struct ListenerEntry {
     mode: ListenerMode,
 }
 
-struct Callback {
-    func: Py<PyAny>,
-    args: Py<PyTuple>,
-    context: Option<Py<PyAny>>,
-}
-
-impl Callback {
+impl Handle {
     fn call(&self, py: Python) -> PyResult<()> {
         if let Some(ctx) = &self.context {
             ctx.call_method1(
                 py,
                 "run",
-                (self.func.clone_ref(py), self.args.clone_ref(py)),
+                (self.callback.clone_ref(py), self.args.clone_ref(py)),
             )?;
             return Ok(());
         } else {
-            self.func.call1(py, (self.args.clone_ref(py),))?;
+            self.callback.call1(py, (self.args.clone_ref(py),))?;
             return Ok(());
         }
     }
@@ -150,7 +149,7 @@ impl Callback {
 
 struct ScheduledCallback {
     when: Instant,
-    callback: Callback,
+    callback: usize,
 }
 
 impl Ord for ScheduledCallback {
@@ -196,7 +195,9 @@ struct EventLoop {
     pending_streams: HashMap<usize, Py<PyTcpStream>>,
     next_stream_id: usize,
     connection_workers: HashMap<usize, ConnectionWorker>,
-    callbacks: VecDeque<Callback>,
+    next_handle_id: usize,
+    active_handlers: HashMap<usize, Handle>,
+    callbacks: VecDeque<usize>,
     scheduled_callbacks: BinaryHeap<ScheduledCallback>,
     copy_context_method: Py<PyAny>,
 }
@@ -260,6 +261,8 @@ impl EventLoop {
             next_listener_id: 0,
             pending_streams: HashMap::new(),
             connection_workers: HashMap::new(),
+            next_handle_id: 0,
+            active_handlers: HashMap::new(),
             callbacks: VecDeque::with_capacity(1024),
             scheduled_callbacks: BinaryHeap::new(),
         })
@@ -333,7 +336,7 @@ impl EventLoop {
         let mut fut = PyFuture::new();
         fut.set_task_id(id);
         let pyfut = Py::new(py, fut)?;
-        
+
         let entry = TaskEntry::new(task, pyfut.clone_ref(py));
         self.tasks_hm.insert(id, entry);
 
@@ -367,15 +370,13 @@ impl EventLoop {
     fn run_task(&mut self, py: Python, id: TaskId) -> PyResult<()> {
         let entry = if let Some(x) = self.tasks_hm.get_mut(&id) {
             x
-        }
-        else {
+        } else {
             return Ok(());
         };
         if entry.cancelled(py) {
             self.pending_io.remove(&id);
             self.tasks_hm.remove(&id);
             return Ok(());
-            
         }
         let current_ctx = self.copy_context_method.call0(py)?;
         let current_ctx_bound = current_ctx.bind(py);
@@ -878,27 +879,40 @@ impl EventLoop {
                 callback,
                 args,
                 context,
+                id,
             } => {
-                self.callbacks.push_back(Callback {
-                    func: callback,
+                let handler = Handle {
+                    callback,
                     args,
                     context,
-                });
+                };
+                self.next_handle_id += 1;
+
+                self.active_handlers.insert(id, handler);
+                self.callbacks.push_back(id);
             }
             Command::CallLater {
                 when,
                 callback,
                 args,
                 context,
+                id,
             } => {
-                self.scheduled_callbacks.push(ScheduledCallback {
-                    when,
-                    callback: Callback {
-                        func: callback,
-                        args,
-                        context,
-                    },
-                });
+                let handler = Handle {
+                    callback,
+                    args,
+                    context,
+                };
+                self.next_handle_id += 1;
+                self.active_handlers.insert(id, handler);
+                self.scheduled_callbacks
+                    .push(ScheduledCallback { when, callback: id });
+            }
+            Command::CancelHandle { handle_id } => {
+                self.active_handlers.remove(&handle_id);
+                self.callbacks.retain(|id| &handle_id != id);
+                self.scheduled_callbacks
+                    .retain(|id| handle_id != id.callback);
             }
             Command::ExecuteHttp {
                 handler_id,
@@ -969,8 +983,10 @@ impl EventLoop {
                 }
             }
             while let Some(cb) = self.callbacks.pop_front() {
-                if let Err(e) = cb.call(py) {
-                    e.print(py);
+                if let Some(handler) = self.active_handlers.get(&cb) {
+                    if let Err(e) = handler.call(py) {
+                        e.print(py);
+                    }
                 }
             }
 
@@ -1096,15 +1112,17 @@ impl RustEventLoop {
         callback: Py<PyAny>,
         args: Py<PyTuple>,
         context: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
+    ) -> PyResult<usize> {
+        let id = self.event_loop.borrow().next_handle_id;
         self.cmd_tx
             .send(Command::CallSoon {
                 callback,
                 args,
                 context,
+                id,
             })
             .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
-        Ok(())
+        Ok(id)
     }
 
     pub fn call_later(
@@ -1113,14 +1131,23 @@ impl RustEventLoop {
         callback: Py<PyAny>,
         args: Py<PyTuple>,
         context: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
+    ) -> PyResult<usize> {
+        let id = self.event_loop.borrow().next_handle_id;
         self.cmd_tx
             .send(Command::CallLater {
                 when: Instant::now() + Duration::from_secs_f64(delay),
                 callback,
                 args,
                 context,
+                id,
             })
+            .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
+        Ok(id)
+    }
+
+    pub fn cancel_handle(&self, handle_id: usize) -> PyResult<()> {
+        self.cmd_tx
+            .send(Command::CancelHandle { handle_id })
             .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
         Ok(())
     }
@@ -1185,7 +1212,7 @@ impl PyEventLoop {
         callback: Py<PyAny>,
         args: Py<PyTuple>,
         context: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
+    ) -> PyResult<usize> {
         self.loop_impl.call_soon(callback, args, context)
     }
 
@@ -1195,8 +1222,12 @@ impl PyEventLoop {
         callback: Py<PyAny>,
         args: Py<PyTuple>,
         context: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
+    ) -> PyResult<usize> {
         self.loop_impl.call_later(delay, callback, args, context)
+    }
+
+    fn cancel_handle(&self, handle_id: usize) -> PyResult<()> {
+        self.loop_impl.cancel_handle(handle_id)
     }
 
     fn spawn(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<()> {

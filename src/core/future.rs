@@ -194,7 +194,10 @@ pub struct PyFuture {
 
 impl From<RustFuture> for PyFuture {
     fn from(value: RustFuture) -> Self {
-        PyFuture { future: value, task_id: None }
+        PyFuture {
+            future: value,
+            task_id: None,
+        }
     }
 }
 
@@ -204,7 +207,7 @@ impl PyFuture {
     pub fn new() -> Self {
         PyFuture {
             future: RustFuture::new(),
-            task_id: None
+            task_id: None,
         }
     }
 

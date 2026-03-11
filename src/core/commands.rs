@@ -16,12 +16,17 @@ pub enum Command {
         callback: Py<PyAny>,
         args: Py<PyTuple>,
         context: Option<Py<PyAny>>,
+        id: usize,
     },
     CallLater {
         when: Instant,
         callback: Py<PyAny>,
         args: Py<PyTuple>,
         context: Option<Py<PyAny>>,
+        id: usize,
+    },
+    CancelHandle {
+        handle_id: usize,
     },
     Stop,
     ExecuteHttp {
