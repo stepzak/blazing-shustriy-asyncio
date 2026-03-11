@@ -152,8 +152,7 @@ impl RustTask {
     pub fn throw(&self, err: PyErr, direct: bool, py: Python) -> StepResult {
         if direct {
             self.inner.lock().throw_direct(err, py)
-        }
-        else {
+        } else {
             self.inner.lock().throw(err, py)
         }
     }

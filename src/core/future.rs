@@ -1,19 +1,17 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use pyo3::{
-    exceptions::{PyRuntimeError, PyStopIteration},
-    prelude::*,
-    IntoPyObjectExt,
-};
+use pyo3::exceptions::asyncio::{CancelledError, InvalidStateError};
+use pyo3::{exceptions::PyStopIteration, prelude::*, IntoPyObjectExt};
 
-pub type CallbackSuccess = Box<dyn FnOnce(Py<PyAny>)>;
-type CallbackErr = Box<dyn FnOnce(PyErr)>;
+pub type CallbackSuccess = Box<dyn FnOnce(Py<PyAny>, Python)>;
+type CallbackErr = Box<dyn FnOnce(PyErr, Python)>;
 
 enum FutureState {
     Pending,
     Success(Py<PyAny>),
     Failure(PyErr),
+    Cancelled,
 }
 
 struct Future {
@@ -33,7 +31,7 @@ impl Future {
 
     fn add_callback<F>(&mut self, callback: F, py: Python)
     where
-        F: FnOnce(Py<PyAny>) + 'static,
+        F: FnOnce(Py<PyAny>, Python) + 'static,
     {
         match &self.state {
             FutureState::Pending => {
@@ -42,14 +40,14 @@ impl Future {
                 }
             }
 
-            FutureState::Success(res) => callback(res.clone_ref(py)),
+            FutureState::Success(res) => callback(res.clone_ref(py), py),
             _ => {}
         }
     }
 
     fn add_err_callback<F>(&mut self, callback: F, py: Python)
     where
-        F: FnOnce(PyErr) + 'static,
+        F: FnOnce(PyErr, Python) + 'static,
     {
         match &self.state {
             FutureState::Pending => {
@@ -59,7 +57,7 @@ impl Future {
             }
 
             FutureState::Failure(e) => {
-                callback(e.clone_ref(py));
+                callback(e.clone_ref(py), py);
             }
             _ => {}
         }
@@ -74,11 +72,11 @@ impl Future {
             }
 
             _ => {
-                return Err(PyRuntimeError::new_err("Future already finished"));
+                return Err(InvalidStateError::new_err("Future already finished"));
             }
         };
         for cb in callbacks {
-            cb(res.clone_ref(py));
+            cb(res.clone_ref(py), py);
         }
         Ok(())
     }
@@ -92,25 +90,43 @@ impl Future {
             }
 
             _ => {
-                return Err(PyRuntimeError::new_err("Future already finished"));
+                return Err(InvalidStateError::new_err("Future already finished"));
             }
         };
 
         for cb in callbacks {
-            cb(exc.clone_ref(py));
+            cb(exc.clone_ref(py), py);
         }
         Ok(())
+    }
+
+    fn cancel(&mut self, py: Python) {
+        if !self.is_done() {
+            self.state = FutureState::Cancelled;
+            let err = CancelledError::new_err("Future cancelled");
+            self.waiters_success.take();
+            if let Some(cbs) = self.waiters_err.take() {
+                for cb in cbs {
+                    cb(err.clone_ref(py), py);
+                }
+            }
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        matches!(self.state, FutureState::Cancelled)
     }
 
     fn is_done(&self) -> bool {
         return !matches!(self.state, FutureState::Pending);
     }
 
-    fn result(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+    fn result(&self, py: Python) -> PyResult<Py<PyAny>> {
         match &self.state {
-            FutureState::Pending => Err(PyRuntimeError::new_err("Future is not yet finished")),
-            FutureState::Success(val) => Ok(Some(val.clone_ref(py))),
+            FutureState::Pending => Err(InvalidStateError::new_err("Future is not yet finished")),
+            FutureState::Success(val) => Ok(val.clone_ref(py)),
             FutureState::Failure(e) => Err(e.clone_ref(py)),
+            FutureState::Cancelled => Err(CancelledError::new_err("Future was cancelled")),
         }
     }
 }
@@ -129,14 +145,14 @@ impl RustFuture {
 
     pub fn add_callback<F>(&self, callback: F, py: Python)
     where
-        F: FnOnce(Py<PyAny>) + 'static,
+        F: FnOnce(Py<PyAny>, Python) + 'static,
     {
         self.inner.lock().add_callback(callback, py);
     }
 
     pub fn add_err_callback<F>(&self, callback: F, py: Python)
     where
-        F: FnOnce(PyErr) + 'static,
+        F: FnOnce(PyErr, Python) + 'static,
     {
         self.inner.lock().add_err_callback(callback, py);
     }
@@ -149,11 +165,19 @@ impl RustFuture {
         self.inner.lock().set_exception(exc, py)
     }
 
+    pub fn cancel(&self, py: Python) {
+        self.inner.lock().cancel(py);
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.inner.lock().cancelled()
+    }
+
     pub fn is_done(&self) -> bool {
         self.inner.lock().is_done()
     }
 
-    pub fn result(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+    pub fn result(&self, py: Python) -> PyResult<Py<PyAny>> {
         self.inner.lock().result(py)
     }
 }
@@ -182,6 +206,48 @@ impl PyFuture {
         self.future.set_result(val, py)
     }
 
+    pub fn add_callback(&self, py: Python, cb: Py<PyAny>) -> PyResult<()> {
+        let callback = move |res: Py<PyAny>, py: Python| {
+            let _ = cb.call1(py, (res,));
+        };
+        self.future.add_callback(callback, py);
+        Ok(())
+    }
+
+    pub fn set_exception(&self, py: Python, exc: Bound<'_, PyAny>) -> PyResult<()> {
+        let err = PyErr::from_value(exc);
+        self.future.set_exception(err, py)
+    }
+
+    pub fn add_err_callback(&self, py: Python, cb: Py<PyAny>) -> PyResult<()> {
+        let callback = move |res: PyErr, py: Python| {
+            let _ = cb.call1(py, (res,));
+        };
+        self.future.add_err_callback(callback, py);
+        Ok(())
+    }
+
+    pub fn add_done_callback(&self, py: Python, cb: Py<PyAny>) -> PyResult<()> {
+        self.add_callback(py, cb.clone_ref(py))?;
+        self.add_err_callback(py, cb)
+    }
+
+    pub fn exception(&self, py: Python) -> Option<PyErr> {
+        match &self.future.inner.lock().state {
+            FutureState::Failure(err) => Some(err.clone_ref(py)),
+            FutureState::Cancelled => Some(CancelledError::new_err("Future cancelled")),
+            _ => None,
+        }
+    }
+
+    pub fn cancel(&self, py: Python) {
+        self.future.cancel(py);
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.future.cancelled()
+    }
+
     pub fn is_done(&self) -> bool {
         self.future.is_done()
     }
@@ -197,7 +263,7 @@ impl PyFuture {
     pub fn __next__(slf: PyRef<'_, Self>, py: Python) -> PyResult<Option<Py<PyAny>>> {
         if slf.is_done() {
             let res = slf.future.result(py)?;
-            Err(PyStopIteration::new_err(res.unwrap_or_else(|| py.None())))
+            Err(PyStopIteration::new_err(res))
         } else {
             Ok(Some(slf.into_py_any(py)?))
         }

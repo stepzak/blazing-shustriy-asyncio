@@ -25,7 +25,7 @@ use crate::{
     core::{
         commands::Command,
         con_worker::{connection_worker, WorkerMode},
-        future::{PyFuture, RustFuture},
+        future::PyFuture,
         io_enums::{ConnectionWorker, IoResult, WorkerCommand},
         net::{
             AcceptIo, BindIo, ConnectIo, ListenerMode, PyTcpListener, PyTcpStream, ReadIo, WriteIo,
@@ -72,9 +72,50 @@ impl GatherState {
 
 struct TaskEntry {
     task: RustTask,
-    future: RustFuture,
+    future: Py<PyFuture>,
     pending_val: Option<Py<PyAny>>,
     pending_err: Option<PyErr>,
+}
+
+impl TaskEntry {
+    fn new(task: RustTask, future: Py<PyFuture>) -> Self {
+        TaskEntry {
+            task,
+            future,
+            pending_val: None,
+            pending_err: None,
+        }
+    }
+
+    fn set_result(&self, py: Python, result: Py<PyAny>) -> PyResult<()> {
+        self.future.borrow(py).future.set_result(result, py)
+    }
+
+    fn set_exception(&self, py: Python, err: PyErr) -> PyResult<()> {
+        self.future.borrow(py).future.set_exception(err, py)
+    }
+
+    fn is_done(&self, py: Python) -> bool {
+        self.future.borrow(py).future.is_done()
+    }
+
+    fn add_callback<F>(&self, py: Python, cb: F) -> PyResult<()>
+    where
+        F: FnOnce(Py<PyAny>, Python) + 'static,
+    {
+        Ok(self.future.borrow(py).future.add_callback(cb, py))
+    }
+
+    fn add_err_callback<F>(&self, py: Python, cb: F) -> PyResult<()>
+    where
+        F: FnOnce(PyErr, Python) + 'static,
+    {
+        Ok(self.future.borrow(py).future.add_err_callback(cb, py))
+    }
+
+    fn cancel(&self, py: Python) {
+        self.future.borrow(py).future.cancel(py);
+    }
 }
 
 struct ListenerEntry {
@@ -87,18 +128,21 @@ struct ListenerEntry {
 struct Callback {
     func: Py<PyAny>,
     args: Py<PyTuple>,
-    context: Option<Py<PyAny>>
+    context: Option<Py<PyAny>>,
 }
 
 impl Callback {
     fn call(&self, py: Python) -> PyResult<()> {
         if let Some(ctx) = &self.context {
-            ctx.call_method1(py, "run", (self.func.clone_ref(py), self.args.clone_ref(py),))?;
-            return Ok(())
-        }
-        else {
+            ctx.call_method1(
+                py,
+                "run",
+                (self.func.clone_ref(py), self.args.clone_ref(py)),
+            )?;
+            return Ok(());
+        } else {
             self.func.call1(py, (self.args.clone_ref(py),))?;
-            return Ok(())
+            return Ok(());
         }
     }
 }
@@ -255,14 +299,14 @@ impl EventLoop {
         gen: &Bound<'_, PyAny>,
         py: Python,
         t_id: Option<TaskId>,
-    ) -> PyResult<RustFuture> {
+    ) -> PyResult<Py<PyFuture>> {
         let coro = if gen.hasattr("__await__").unwrap_or(false) {
             match gen.call_method0("__await__") {
                 Ok(x) => x,
                 Err(exc) => {
-                    let fut = RustFuture::new();
-                    let _ = fut.set_exception(exc, py);
-                    return Ok(fut);
+                    let fut = PyFuture::new();
+                    let _ = fut.set_exception(py, exc.into_bound_py_any(py).unwrap());
+                    return Ok(Py::new(py, fut)?);
                 }
             }
         } else {
@@ -277,19 +321,11 @@ impl EventLoop {
         };
         let context = self.copy_context_method.bind(py).call0()?.unbind();
         let task = RustTask::new(&coro, context);
-        let fut = RustFuture::new();
+        let pyfut = Py::new(py, PyFuture::new())?;
+        let entry = TaskEntry::new(task, pyfut.clone_ref(py));
+        self.tasks_hm.insert(id, entry);
 
-        self.tasks_hm.insert(
-            id,
-            TaskEntry {
-                task,
-                future: fut.clone(),
-                pending_val: None,
-                pending_err: None,
-            },
-        );
-
-        Ok(fut)
+        Ok(pyfut)
     }
 
     fn schedule_task(&mut self, id: TaskId) {
@@ -303,12 +339,12 @@ impl EventLoop {
             StepResult::Yield(value) => self.handle_yield(id, value, py)?,
             StepResult::Success(result) => {
                 if let Some(entry) = self.tasks_hm.remove(&id) {
-                    entry.future.set_result(result, py)?;
+                    entry.set_result(py, result)?;
                 }
             }
             StepResult::Failure(err) => {
                 if let Some(entry) = self.tasks_hm.remove(&id) {
-                    entry.future.set_exception(err.clone_ref(py), py)?;
+                    entry.set_exception(py, err.clone_ref(py))?;
                     return Err(err);
                 }
             }
@@ -326,17 +362,13 @@ impl EventLoop {
 
         let needs_switch = entry.task.needs_context_switch(current_ctx_bound, py);
         if let Some(err) = entry.pending_err.take() {
-            let step_res = {
-                entry.task.throw(err, !needs_switch, py)
-            };
+            let step_res = { entry.task.throw(err, !needs_switch, py) };
             return self.process_step(id, step_res, py);
         }
 
         let pending_val = entry.pending_val.take();
 
-        let step_res = {
-            entry.task.step(pending_val, !needs_switch, py)
-        };
+        let step_res = { entry.task.step(pending_val, !needs_switch, py) };
 
         self.process_step(id, step_res, py)
     }
@@ -588,14 +620,14 @@ impl EventLoop {
                     let my_id = id;
 
                     inner_future.add_callback(
-                        move |res: Py<PyAny>| {
+                        move |res: Py<PyAny>, _| {
                             tx_clone.send((my_id, Ok(res))).ok();
                         },
                         py,
                     );
                     let tx_err_callback = self.wake_tx.clone();
                     inner_future.add_err_callback(
-                        move |err: PyErr| {
+                        move |err: PyErr, _| {
                             tx_err_callback.send((my_id, Err(err))).ok();
                         },
                         py,
@@ -606,34 +638,35 @@ impl EventLoop {
             }
         }
         if val_binded.hasattr("send").unwrap_or(false) {
-            let child_future = self.create_task(val_binded.cast()?, py, None)?;
-            let child_id = self.next_id - 1;
-            self.schedule_task(child_id);
+            let child_id = self.next_id;
+            self.next_id += 1;
 
-            let tx_clone = self.wake_tx.clone();
-            let my_id = id;
+            match self.create_task(val_binded.cast()?, py, Some(child_id)) {
+                Ok(_) => {
+                    self.schedule_task(child_id);
 
-            child_future.add_callback(
-                move |res| {
-                    tx_clone.send((my_id, Ok(res))).ok();
-                },
-                py,
-            );
-            let tx_err_callback = self.wake_tx.clone();
-            child_future.add_err_callback(
-                move |err| {
-                    tx_err_callback.send((my_id, Err(err))).ok();
-                },
-                py,
-            );
+                    if let Some(entry) = self.tasks_hm.get(&child_id) {
+                        let tx_clone = self.wake_tx.clone();
+                        let my_id = id;
 
-            return Ok(());
+                        entry.add_callback(py, move |res, _| {
+                            let _ = tx_clone.send((my_id, Ok(res)));
+                        })?;
+
+                        let tx_err_callback = self.wake_tx.clone();
+                        entry.add_err_callback(py, move |err, _| {
+                            let _ = tx_err_callback.send((my_id, Err(err)));
+                        })?;
+                    }
+                }
+                Err(e) => {
+                    let entry = self.tasks_hm.get_mut(&id).unwrap();
+                    entry.pending_err = Some(e);
+                    self.task_deq.push_back(id);
+                }
+            }
         }
-
-        let entry = self.tasks_hm.get_mut(&id).unwrap();
-        entry.pending_val = Some(val);
-        self.task_deq.push_back(id);
-        Ok(())
+        return Ok(());
     }
 
     fn handle_gather(&mut self, id: TaskId, gather: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
@@ -649,36 +682,31 @@ impl EventLoop {
             if !coro.hasattr("send").unwrap_or(false) {
                 return Err(PyRuntimeError::new_err("All args must be generators"));
             }
-            let child_fut = self.create_task(coro.cast()?, py, None)?;
-            let child_id = self.next_id - 1;
+            let child_id = self.next_id;
+            self.next_id += 1;
+            let _ = self.create_task(coro.cast()?, py, Some(child_id))?;
             self.schedule_task(child_id);
-
+            let entry = self.tasks_hm.get(&child_id).unwrap();
             let st = Arc::clone(&state);
             let tx_cb = tx_clone.clone();
             let my_idx = idx;
 
-            child_fut.add_callback(
-                move |res| {
-                    let maybe_list = {
-                        let mut s = st.borrow_mut();
-                        s.add_result(my_idx, res)
-                    };
-                    if let Some(list) = maybe_list {
-                        Python::attach(|py| {
-                            let py_list = PyList::new(py, list).unwrap();
-                            tx_cb.send((my_id, Ok(py_list.into()))).ok();
-                        });
-                    }
-                },
-                py,
-            );
+            entry.add_callback(py, move |res, _| {
+                let maybe_list = {
+                    let mut s = st.borrow_mut();
+                    s.add_result(my_idx, res)
+                };
+                if let Some(list) = maybe_list {
+                    Python::attach(|py| {
+                        let py_list = PyList::new(py, list).unwrap();
+                        tx_cb.send((my_id, Ok(py_list.into()))).ok();
+                    });
+                }
+            })?;
             let err_cb = tx_clone.clone();
-            child_fut.add_err_callback(
-                move |err| {
-                    err_cb.send((my_id, Err(err))).ok();
-                },
-                py,
-            );
+            entry.add_err_callback(py, move |err, _| {
+                err_cb.send((my_id, Err(err))).ok();
+            })?;
         }
         Ok(())
     }
@@ -826,25 +854,29 @@ impl EventLoop {
                 self.create_task(gen_bound, py, Some(id))?;
                 self.schedule_task(id);
             }
-            Command::CallSoon { callback, args, context } => {
+            Command::CallSoon {
+                callback,
+                args,
+                context,
+            } => {
                 self.callbacks.push_back(Callback {
                     func: callback,
                     args,
-                    context
+                    context,
                 });
             }
             Command::CallLater {
                 when,
                 callback,
                 args,
-                context
+                context,
             } => {
                 self.scheduled_callbacks.push(ScheduledCallback {
                     when,
                     callback: Callback {
                         func: callback,
                         args,
-                        context
+                        context,
                     },
                 });
             }
@@ -877,28 +909,23 @@ impl EventLoop {
                 self.next_id += 1;
 
                 let bound = gen.bind(py);
-                let fut = self.create_task(bound, py, Some(task_id))?;
+                let _ = self.create_task(bound, py, Some(task_id))?;
+                let entry = self.tasks_hm.get(&task_id).unwrap();
                 let tx_clone = shared_tx.clone();
-                fut.add_callback(
-                    move |res: Py<PyAny>| {
-                        Python::attach(move |py_| {
-                            let response = convert_to_response(py_, res);
-                            if let Some(tx) = tx_clone.lock().take() {
-                                let _ = tx.send(Ok(response));
-                            }
-                        })
-                    },
-                    py,
-                );
-                let tx_clone = shared_tx;
-                fut.add_err_callback(
-                    move |_| {
+                entry.add_callback(py, move |res: Py<PyAny>, _| {
+                    Python::attach(move |py_| {
+                        let response = convert_to_response(py_, res);
                         if let Some(tx) = tx_clone.lock().take() {
-                            let _ = tx.send(Err(()));
+                            let _ = tx.send(Ok(response));
                         }
-                    },
-                    py,
-                );
+                    })
+                })?;
+                let tx_clone = shared_tx;
+                entry.add_err_callback(py, move |_, _| {
+                    if let Some(tx) = tx_clone.lock().take() {
+                        let _ = tx.send(Err(()));
+                    }
+                })?;
 
                 self.schedule_task(task_id);
             }
@@ -1040,24 +1067,39 @@ impl RustEventLoop {
         })
     }
 
-    pub fn create_task(&self, gen: &Bound<'_, PyAny>, py: Python) -> PyResult<RustFuture> {
+    pub fn create_task(&self, gen: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyFuture>> {
         self.event_loop.borrow_mut().create_task(gen, py, None)
     }
 
-    pub fn call_soon(&self, callback: Py<PyAny>, args: Py<PyTuple>, context: Option<Py<PyAny>>) -> PyResult<()> {
+    pub fn call_soon(
+        &self,
+        callback: Py<PyAny>,
+        args: Py<PyTuple>,
+        context: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
         self.cmd_tx
-            .send(Command::CallSoon { callback, args, context })
+            .send(Command::CallSoon {
+                callback,
+                args,
+                context,
+            })
             .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
         Ok(())
     }
 
-    pub fn call_later(&self, delay: f64, callback: Py<PyAny>, args: Py<PyTuple>, context: Option<Py<PyAny>>) -> PyResult<()> {
+    pub fn call_later(
+        &self,
+        delay: f64,
+        callback: Py<PyAny>,
+        args: Py<PyTuple>,
+        context: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
         self.cmd_tx
             .send(Command::CallLater {
                 when: Instant::now() + Duration::from_secs_f64(delay),
                 callback,
                 args,
-                context
+                context,
             })
             .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
         Ok(())
@@ -1108,17 +1150,28 @@ impl PyEventLoop {
         })
     }
 
-    fn create_task(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    fn create_task(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<Py<PyFuture>> {
         let py = slf.py();
         let fut = slf.borrow().loop_impl.create_task(gen, py)?;
-        Ok(Py::new(py, PyFuture { future: fut })?.into_any())
+        Ok(fut)
     }
 
-    fn call_soon(&self, callback: Py<PyAny>, args: Py<PyTuple>, context: Option<Py<PyAny>>) -> PyResult<()> {
+    fn call_soon(
+        &self,
+        callback: Py<PyAny>,
+        args: Py<PyTuple>,
+        context: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
         self.loop_impl.call_soon(callback, args, context)
     }
 
-    fn call_later(&self, delay: f64, callback: Py<PyAny>, args: Py<PyTuple>, context: Option<Py<PyAny>>) -> PyResult<()> {
+    fn call_later(
+        &self,
+        delay: f64,
+        callback: Py<PyAny>,
+        args: Py<PyTuple>,
+        context: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
         self.loop_impl.call_later(delay, callback, args, context)
     }
 
