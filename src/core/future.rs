@@ -4,6 +4,8 @@ use parking_lot::Mutex;
 use pyo3::exceptions::asyncio::{CancelledError, InvalidStateError};
 use pyo3::{exceptions::PyStopIteration, prelude::*, IntoPyObjectExt};
 
+use crate::core::task::TaskId;
+
 pub type CallbackSuccess = Box<dyn FnOnce(Py<PyAny>, Python)>;
 type CallbackErr = Box<dyn FnOnce(PyErr, Python)>;
 
@@ -100,7 +102,7 @@ impl Future {
         Ok(())
     }
 
-    fn cancel(&mut self, py: Python) {
+    fn cancel(&mut self, py: Python) -> bool {
         if !self.is_done() {
             self.state = FutureState::Cancelled;
             let err = CancelledError::new_err("Future cancelled");
@@ -110,7 +112,9 @@ impl Future {
                     cb(err.clone_ref(py), py);
                 }
             }
+            return true;
         }
+        false
     }
 
     fn cancelled(&self) -> bool {
@@ -165,8 +169,8 @@ impl RustFuture {
         self.inner.lock().set_exception(exc, py)
     }
 
-    pub fn cancel(&self, py: Python) {
-        self.inner.lock().cancel(py);
+    pub fn cancel(&self, py: Python) -> bool {
+        self.inner.lock().cancel(py)
     }
 
     pub fn cancelled(&self) -> bool {
@@ -185,11 +189,12 @@ impl RustFuture {
 #[pyclass(unsendable)]
 pub struct PyFuture {
     pub future: RustFuture,
+    pub task_id: Option<TaskId>,
 }
 
 impl From<RustFuture> for PyFuture {
     fn from(value: RustFuture) -> Self {
-        PyFuture { future: value }
+        PyFuture { future: value, task_id: None }
     }
 }
 
@@ -199,11 +204,16 @@ impl PyFuture {
     pub fn new() -> Self {
         PyFuture {
             future: RustFuture::new(),
+            task_id: None
         }
     }
 
     pub fn set_result(&self, py: Python, val: Py<PyAny>) -> PyResult<()> {
         self.future.set_result(val, py)
+    }
+
+    pub fn set_task_id(&mut self, id: TaskId) {
+        self.task_id = Some(id);
     }
 
     pub fn add_callback(&self, py: Python, cb: Py<PyAny>) -> PyResult<()> {
@@ -240,8 +250,8 @@ impl PyFuture {
         }
     }
 
-    pub fn cancel(&self, py: Python) {
-        self.future.cancel(py);
+    pub fn cancel(&self, py: Python) -> bool {
+        self.future.cancel(py)
     }
 
     pub fn cancelled(&self) -> bool {

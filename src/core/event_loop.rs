@@ -95,10 +95,6 @@ impl TaskEntry {
         self.future.borrow(py).future.set_exception(err, py)
     }
 
-    fn is_done(&self, py: Python) -> bool {
-        self.future.borrow(py).future.is_done()
-    }
-
     fn add_callback<F>(&self, py: Python, cb: F) -> PyResult<()>
     where
         F: FnOnce(Py<PyAny>, Python) + 'static,
@@ -113,9 +109,14 @@ impl TaskEntry {
         Ok(self.future.borrow(py).future.add_err_callback(cb, py))
     }
 
-    fn cancel(&self, py: Python) {
-        self.future.borrow(py).future.cancel(py);
+    fn cancel(&self, py: Python) -> bool {
+        self.future.borrow(py).future.cancel(py)
     }
+
+    fn cancelled(&self, py: Python) -> bool {
+        self.future.borrow(py).future.cancelled()
+    }
+
 }
 
 struct ListenerEntry {
@@ -294,6 +295,14 @@ impl EventLoop {
         self.task_deq.pop_front()
     }
 
+    fn cancel(&mut self, py: Python, id: TaskId) -> bool {
+        if let Some(entry) = self.tasks_hm.get_mut(&id) {
+            entry.cancel(py)
+        } else {
+            false
+        }
+    }
+
     fn create_task(
         &mut self,
         gen: &Bound<'_, PyAny>,
@@ -321,7 +330,10 @@ impl EventLoop {
         };
         let context = self.copy_context_method.bind(py).call0()?.unbind();
         let task = RustTask::new(&coro, context);
-        let pyfut = Py::new(py, PyFuture::new())?;
+        let mut fut = PyFuture::new();
+        fut.set_task_id(id);
+        let pyfut = Py::new(py, fut)?;
+        
         let entry = TaskEntry::new(task, pyfut.clone_ref(py));
         self.tasks_hm.insert(id, entry);
 
@@ -353,12 +365,20 @@ impl EventLoop {
     }
 
     fn run_task(&mut self, py: Python, id: TaskId) -> PyResult<()> {
-        if !self.tasks_hm.contains_key(&id) {
+        let entry = if let Some(x) = self.tasks_hm.get_mut(&id) {
+            x
+        }
+        else {
             return Ok(());
+        };
+        if entry.cancelled(py) {
+            self.pending_io.remove(&id);
+            self.tasks_hm.remove(&id);
+            return Ok(());
+            
         }
         let current_ctx = self.copy_context_method.call0(py)?;
         let current_ctx_bound = current_ctx.bind(py);
-        let entry = self.tasks_hm.get_mut(&id).unwrap();
 
         let needs_switch = entry.task.needs_context_switch(current_ctx_bound, py);
         if let Some(err) = entry.pending_err.take() {
@@ -1128,6 +1148,10 @@ impl RustEventLoop {
         self.event_loop.borrow_mut().run_until_complete(coro, py)
     }
 
+    pub fn cancel(&self, py: Python, task_id: TaskId) -> bool {
+        self.event_loop.borrow_mut().cancel(py, task_id)
+    }
+
     pub fn stop(&self) -> PyResult<()> {
         self.cmd_tx
             .send(Command::Stop)
@@ -1182,6 +1206,10 @@ impl PyEventLoop {
 
     fn run_forever(&self, py: Python) -> PyResult<()> {
         self.loop_impl.run_forever(py)
+    }
+
+    fn cancel(&self, py: Python, task_id: TaskId) -> bool {
+        self.loop_impl.cancel(py, task_id)
     }
 
     fn run_until_complete(&self, coro: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
