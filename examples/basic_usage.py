@@ -1,5 +1,5 @@
 import time
-from blazing_shustriy_asyncio import EventLoop, sleep, gather
+from blazing_shustriy_asyncio import BlazingEventLoop as EventLoop, sleep, gather
 
 async def worker(name: str, delay: str):
     await sleep(delay)

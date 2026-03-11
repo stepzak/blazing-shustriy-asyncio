@@ -1,4 +1,4 @@
-use crossbeam_channel::{self as cb, Receiver, Sender};
+use crossbeam_channel::{self as cb, select, Receiver, Sender};
 use parking_lot::Mutex;
 use pyo3::{
     exceptions::{PyConnectionError, PyRuntimeError},
@@ -18,7 +18,7 @@ use std::{
 use tokio::{
     net::{TcpListener as TokioListener, TcpStream as TokioStream},
     runtime::Runtime,
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
 
 use crate::{
@@ -118,6 +118,7 @@ impl TaskEntry {
     }
 }
 
+#[derive(Debug)]
 struct Handle {
     callback: Py<PyAny>,
     args: Py<PyTuple>,
@@ -134,14 +135,26 @@ struct ListenerEntry {
 impl Handle {
     fn call(&self, py: Python) -> PyResult<()> {
         if let Some(ctx) = &self.context {
-            ctx.call_method1(
+            let args = self.args.bind(py);
+            println!("len args ctx: {}", args.len());
+
+            let mut p_args: Vec<Bound<'_, PyAny>> = Vec::with_capacity(args.len() + 1);
+
+            p_args.push(self.callback.clone_ref(py).into_bound(py));
+            println!("{:?}", self.callback.bind(py).repr());
+            p_args.extend(args.iter());
+            let final_tuple = PyTuple::new(py, p_args)?;
+            ctx.call_method(
                 py,
                 "run",
-                (self.callback.clone_ref(py), self.args.clone_ref(py)),
+                final_tuple,
+                None,
             )?;
             return Ok(());
         } else {
-            self.callback.call1(py, (self.args.clone_ref(py),))?;
+            let args = self.args.bind(py);
+            println!("len args: {}", args.len());
+            self.callback.call(py, args, None)?;
             return Ok(());
         }
     }
@@ -203,7 +216,7 @@ struct EventLoop {
     copy_context_method: Py<PyAny>,
     wakeup_tx: Sender<()>,
     wakeup_rx: Receiver<()>,
-    current_task: RefCell<Option<TaskId>>
+    current_task: RefCell<Option<TaskId>>,
 }
 
 impl EventLoop {
@@ -241,7 +254,7 @@ impl EventLoop {
             .enable_all()
             .build()
             .unwrap();
-        let (wakeup_tx, wakeup_rx) = cb::bounded(1); 
+        let (wakeup_tx, wakeup_rx) = cb::bounded(1);
         Ok(EventLoop {
             start_time: Instant::now(),
             copy_context_method: copy_context.unbind(),
@@ -273,7 +286,7 @@ impl EventLoop {
             scheduled_callbacks: BinaryHeap::new(),
             wakeup_tx,
             wakeup_rx,
-            current_task: RefCell::new(None)
+            current_task: RefCell::new(None),
         })
     }
 
@@ -290,9 +303,9 @@ impl EventLoop {
     }
 
     fn wakeup(&self) -> PyResult<()> {
-        self.wakeup_tx.send(()).map_err(|_| 
-            PyRuntimeError::new_err("Failed to wake up event loop")
-        )?;
+        self.wakeup_tx
+            .send(())
+            .map_err(|_| PyRuntimeError::new_err("Failed to wake up event loop"))?;
         Ok(())
     }
 
@@ -320,7 +333,13 @@ impl EventLoop {
 
     fn cancel(&mut self, py: Python, id: TaskId) -> bool {
         if let Some(entry) = self.tasks_hm.get(&id) {
-            entry.cancel(py)
+            let cancelled = entry.cancel(py);
+            if cancelled {
+                self.pending_io.remove(&id);
+                self.task_deq.retain(|&task_id| task_id != id);
+                self.connection_workers.remove(&id);
+            }
+            cancelled
         } else {
             false
         }
@@ -394,32 +413,38 @@ impl EventLoop {
     fn run_task(&mut self, py: Python, id: TaskId) -> PyResult<()> {
         let prev = self.current_task();
         *self.current_task.borrow_mut() = Some(id);
+
+        // Получаем entry и сразу проверяем
         let entry = if let Some(x) = self.tasks_hm.get_mut(&id) {
             x
         } else {
+            *self.current_task.borrow_mut() = prev;
             return Ok(());
-        };        if entry.cancelled(py) {
+        };
+
+        if entry.cancelled(py) {
             self.pending_io.remove(&id);
             self.tasks_hm.remove(&id);
             *self.current_task.borrow_mut() = prev;
             return Ok(());
         }
+
         let current_ctx = self.copy_context_method.call0(py)?;
         let current_ctx_bound = current_ctx.bind(py);
-
         let needs_switch = entry.task.needs_context_switch(current_ctx_bound, py);
-        if let Some(err) = entry.pending_err.take() {
-            let step_res = { entry.task.throw(err, !needs_switch, py) };
-            return self.process_step(id, step_res, py);
-        }
 
-        let pending_val = entry.pending_val.take();
+        // Выполняем шаг
+        let result = if let Some(err) = entry.pending_err.take() {
+            let step_res = entry.task.throw(err, !needs_switch, py);
+            self.process_step(id, step_res, py)
+        } else {
+            let pending_val = entry.pending_val.take();
+            let step_res = entry.task.step(pending_val, !needs_switch, py);
+            self.process_step(id, step_res, py)
+        };
 
-        let step_res = { entry.task.step(pending_val, !needs_switch, py) };
-        
         *self.current_task.borrow_mut() = prev;
-
-        self.process_step(id, step_res, py)
+        result
     }
 
     fn handle_bind(
@@ -898,17 +923,29 @@ impl EventLoop {
 
     fn handle_command(&mut self, cmd: Command, py: Python) -> PyResult<()> {
         match cmd {
-            Command::Spawn { coro, id } => {
+            Command::CreateTask { coro, tx } => {
+                println!("Creating 2");
+                let fut = self.create_task(coro.bind(py), py, None)?;
+                let _ = tx.send(fut);
+            }
+            Command::Spawn { coro, tx } => {
                 let gen_bound = coro.bind(py);
+                let id = self.next_id;
+                self.next_id += 1;
                 self.create_task(gen_bound, py, Some(id))?;
                 self.schedule_task(id);
+                tx.send(id)
+                    .map_err(|_| PyRuntimeError::new_err("Channel fault"))?;
             }
             Command::CallSoon {
                 callback,
                 args,
                 context,
-                id,
+                tx,
             } => {
+                println!("got msg");
+                let id = self.next_handle_id;
+                self.next_handle_id += 1;
                 let handler = Handle {
                     callback,
                     args,
@@ -916,22 +953,28 @@ impl EventLoop {
                 };
                 self.active_handlers.insert(id, handler);
                 self.callbacks.push_back(id);
+                tx.send(id)
+                    .map_err(|_| PyRuntimeError::new_err("Channel fault"))?;
             }
             Command::CallLater {
                 when,
                 callback,
                 args,
                 context,
-                id,
+                tx,
             } => {
                 let handler = Handle {
                     callback,
                     args,
                     context,
                 };
+                let id = self.next_handle_id;
+                self.next_handle_id += 1;
                 self.active_handlers.insert(id, handler);
                 self.scheduled_callbacks
                     .push(ScheduledCallback { when, callback: id });
+                tx.send(id)
+                    .map_err(|_| PyRuntimeError::new_err("Channel fault"))?;
             }
             Command::CancelHandle { handle_id } => {
                 self.active_handlers.remove(&handle_id);
@@ -996,6 +1039,7 @@ impl EventLoop {
     }
 
     fn run_forever(&mut self, py: Python) -> PyResult<()> {
+        println!("...");
         loop {
             let mut had_events = false;
             let now = Instant::now();
@@ -1007,33 +1051,34 @@ impl EventLoop {
                     break;
                 }
             }
+            println!("break 1");
             while let Some(cb) = self.callbacks.pop_front() {
+                println!("{cb}");
                 if let Some(handler) = self.active_handlers.remove(&cb) {
+                    println!("Calling");
                     if let Err(e) = handler.call(py) {
+                        println!("{e:?}, {handler:?}");
                         e.print(py);
                     }
                 }
+                println!("{}", self.callbacks.len());
             }
-
+            println!("break 2");
             while let Ok((id, res_result)) = self.wake_rx.try_recv() {
                 had_events = true;
                 self.handle_wake(id, res_result)?;
             }
-
+            println!("break 3");
             while let Ok((id, result)) = self.io_rx.try_recv() {
                 had_events = true;
                 self.handle_io(id, result, py)?;
             }
-
+            println!("break 3");
             while let Ok(cmd) = self.cmd_rx.try_recv() {
                 had_events = true;
                 self.handle_command(cmd, py)?;
             }
-
-            if let Ok(()) = self.wakeup_rx.try_recv() {
-                had_events = true;
-            }
-
+            println!("break 4");
             let ready_timers = self.check_timers();
             if !ready_timers.is_empty() {
                 had_events = true;
@@ -1052,7 +1097,7 @@ impl EventLoop {
                     break;
                 }
             }
-
+            println!("{had_events}");
             if !had_events {
                 py.check_signals()?;
                 let sleep_duration = match self.next_timer {
@@ -1078,8 +1123,16 @@ impl EventLoop {
                     }
                 };
                 if let Some(duration) = sleep_duration {
-                    py.detach(|| std::thread::sleep(duration));
-                    continue;
+                    select! {
+                        recv(self.wakeup_rx) -> _ => {
+                            py.check_signals()?;
+                            continue
+                        }
+                        default(duration) => {
+                            py.detach(|| std::thread::sleep(duration));
+                            continue;
+                        }
+                    }
                 }
             }
         }
@@ -1091,6 +1144,7 @@ impl EventLoop {
     fn run_until_complete(&mut self, coro: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
         self.create_task(coro, py, None)?;
         let id = self.next_id - 1;
+        println!("{id}");
         self.schedule_task(id);
         self.run_forever(py)
     }
@@ -1133,11 +1187,28 @@ impl RustEventLoop {
     }
 
     pub fn time(&self) -> f64 {
-        self.event_loop.borrow().time()
+        if let Ok(e_loop) = self.event_loop.try_borrow() {
+            e_loop.time()
+        } else {
+            std::time::Instant::now().elapsed().as_secs_f64()
+        }
     }
 
-    pub fn create_task(&self, gen: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyFuture>> {
-        self.event_loop.borrow_mut().create_task(gen, py, None)
+    pub fn create_task(&self, gen: &Bound<'_, PyAny>) -> PyResult<Py<PyFuture>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let unbound = gen.clone().unbind();
+        println!("Creating 1");
+        self.cmd_tx
+            .send(Command::CreateTask {
+                coro: unbound,
+                tx: response_tx,
+            })
+            .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
+
+        match response_rx.blocking_recv() {
+            Ok(pyfut) => Ok(pyfut),
+            Err(_) => Err(PyRuntimeError::new_err("Failed to create task")),
+        }
     }
 
     pub fn current_task(&self) -> Option<TaskId> {
@@ -1154,20 +1225,35 @@ impl RustEventLoop {
         args: Py<PyTuple>,
         context: Option<Py<PyAny>>,
     ) -> PyResult<usize> {
-        let id = {
-            let mut e_loop = self.event_loop.borrow_mut();
-            e_loop.next_handle_id += 1;
-            e_loop.next_handle_id - 1
-        };
-        self.cmd_tx
-            .send(Command::CallSoon {
+        if let Ok(mut event_loop) = self.event_loop.try_borrow_mut() {
+            let id = event_loop.next_handle_id;
+            event_loop.next_handle_id += 1;
+
+            let handler = Handle {
                 callback,
                 args,
                 context,
-                id,
-            })
-            .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
-        Ok(id)
+            };
+            event_loop.active_handlers.insert(id, handler);
+            event_loop.callbacks.push_back(id);
+
+            Ok(id)
+        } else {
+            let (response_tx, response_rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::CallSoon {
+                    callback,
+                    args,
+                    context,
+                    tx: response_tx,
+                })
+                .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
+            println!("sent");
+            match response_rx.blocking_recv() {
+                Ok(res) => Ok(res),
+                Err(_) => Err(PyRuntimeError::new_err("Event loop is closed")),
+            }
+        }
     }
 
     pub fn call_later(
@@ -1177,21 +1263,37 @@ impl RustEventLoop {
         args: Py<PyTuple>,
         context: Option<Py<PyAny>>,
     ) -> PyResult<usize> {
-        let id = {
-            let mut e_loop = self.event_loop.borrow_mut();
-            e_loop.next_handle_id += 1;
-            e_loop.next_handle_id - 1
-        };
-        self.cmd_tx
-            .send(Command::CallLater {
-                when: Instant::now() + Duration::from_secs_f64(delay),
+        if let Ok(mut event_loop) = self.event_loop.try_borrow_mut() {
+            let id = event_loop.next_handle_id;
+            event_loop.next_handle_id += 1;
+
+            let handler = Handle {
                 callback,
                 args,
                 context,
-                id,
-            })
-            .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
-        Ok(id)
+            };
+            event_loop.active_handlers.insert(id, handler);
+            event_loop.scheduled_callbacks.push(ScheduledCallback {
+                when: Instant::now() + Duration::from_secs_f64(delay),
+                callback: id,
+            });
+            Ok(id)
+        } else {
+            let (response_tx, response_rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::CallLater {
+                    when: Instant::now() + Duration::from_secs_f64(delay),
+                    callback,
+                    args,
+                    context,
+                    tx: response_tx,
+                })
+                .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
+            match response_rx.blocking_recv() {
+                Ok(res) => Ok(res),
+                Err(_) => Err(PyRuntimeError::new_err("Event loop is closed")),
+            }
+        }
     }
 
     pub fn cancel_handle(&self, handle_id: usize) -> PyResult<()> {
@@ -1202,18 +1304,26 @@ impl RustEventLoop {
     }
 
     pub fn spawn(&self, gen: &Bound<'_, PyAny>) -> PyResult<usize> {
-        let unbound = gen.clone().unbind();
-        let mut loop_ref = self.event_loop.borrow_mut();
-        let task_id = loop_ref.next_id;
-        loop_ref.next_id += 1;
-        drop(loop_ref);
-        self.cmd_tx
-            .send(Command::Spawn {
-                coro: unbound,
-                id: task_id,
-            })
-            .map_err(|_| PyRuntimeError::new_err("Event loop command channel closed"))?;
-        Ok(task_id)
+        if let Ok(mut ev_loop) = self.event_loop.try_borrow_mut() {
+            let id = ev_loop.next_id;
+            ev_loop.next_id += 1;
+            ev_loop.create_task(gen, gen.py(), Some(id))?;
+            ev_loop.schedule_task(id);
+            Ok(id)
+        } else {
+            let unbound = gen.clone().unbind();
+            let (response_tx, response_rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::Spawn {
+                    coro: unbound,
+                    tx: response_tx,
+                })
+                .map_err(|_| PyRuntimeError::new_err("Event loop command channel closed"))?;
+            match response_rx.blocking_recv() {
+                Ok(res) => Ok(res),
+                Err(_) => Err(PyRuntimeError::new_err("Event loop is closed")),
+            }
+        }
     }
 
     pub fn run_forever(&self, py: Python) -> PyResult<()> {
@@ -1221,6 +1331,7 @@ impl RustEventLoop {
     }
 
     pub fn run_until_complete(&self, coro: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
+        println!("Running forever");
         self.event_loop.borrow_mut().run_until_complete(coro, py)
     }
 
@@ -1255,8 +1366,7 @@ impl PyEventLoop {
     }
 
     fn create_task(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<Py<PyFuture>> {
-        let py = slf.py();
-        let fut = slf.borrow().loop_impl.create_task(gen, py)?;
+        let fut = slf.borrow().loop_impl.create_task(gen)?;
         Ok(fut)
     }
 

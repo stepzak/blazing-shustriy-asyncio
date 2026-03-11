@@ -1,5 +1,5 @@
 from blazing_shustriy_asyncio import TcpListener, TcpStream
-from blazing_shustriy_asyncio.core.event_loop import EventLoop
+from blazing_shustriy_asyncio.core.event_loop import BlazingEventLoop as EventLoop
 
 async def main(loop: EventLoop):
     listener = await TcpListener().bind("127.0.0.1:8080")

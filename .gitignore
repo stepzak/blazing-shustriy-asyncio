@@ -10,6 +10,7 @@ __pycache__/
 test.py
 server.py
 test_exc.py
+test_asyncio.py
 Dockerfile
 # Distribution / packaging
 .Python
