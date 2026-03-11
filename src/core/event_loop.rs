@@ -173,6 +173,7 @@ impl PartialEq for ScheduledCallback {
 impl Eq for ScheduledCallback {}
 
 struct EventLoop {
+    start_time: Instant,
     tasks_hm: HashMap<TaskId, TaskEntry>,
     task_deq: VecDeque<TaskId>,
     timers: BTreeMap<Instant, Vec<TaskId>>,
@@ -200,6 +201,9 @@ struct EventLoop {
     callbacks: VecDeque<usize>,
     scheduled_callbacks: BinaryHeap<ScheduledCallback>,
     copy_context_method: Py<PyAny>,
+    wakeup_tx: Sender<()>,
+    wakeup_rx: Receiver<()>,
+    current_task: RefCell<Option<TaskId>>
 }
 
 impl EventLoop {
@@ -237,7 +241,9 @@ impl EventLoop {
             .enable_all()
             .build()
             .unwrap();
+        let (wakeup_tx, wakeup_rx) = cb::bounded(1); 
         Ok(EventLoop {
+            start_time: Instant::now(),
             copy_context_method: copy_context.unbind(),
             tasks_hm: HashMap::with_capacity(1024),
             task_deq: VecDeque::with_capacity(1024),
@@ -265,7 +271,14 @@ impl EventLoop {
             active_handlers: HashMap::new(),
             callbacks: VecDeque::with_capacity(1024),
             scheduled_callbacks: BinaryHeap::new(),
+            wakeup_tx,
+            wakeup_rx,
+            current_task: RefCell::new(None)
         })
+    }
+
+    fn time(&self) -> f64 {
+        self.start_time.elapsed().as_secs_f64()
     }
 
     fn add_timer(&mut self, when: Instant, task_id: TaskId) {
@@ -274,6 +287,13 @@ impl EventLoop {
             .or_insert_with(Vec::new)
             .push(task_id);
         self.next_timer = self.timers.keys().next().copied();
+    }
+
+    fn wakeup(&self) -> PyResult<()> {
+        self.wakeup_tx.send(()).map_err(|_| 
+            PyRuntimeError::new_err("Failed to wake up event loop")
+        )?;
+        Ok(())
     }
 
     fn check_timers(&mut self) -> Vec<TaskId> {
@@ -299,7 +319,7 @@ impl EventLoop {
     }
 
     fn cancel(&mut self, py: Python, id: TaskId) -> bool {
-        if let Some(entry) = self.tasks_hm.get_mut(&id) {
+        if let Some(entry) = self.tasks_hm.get(&id) {
             entry.cancel(py)
         } else {
             false
@@ -367,15 +387,21 @@ impl EventLoop {
         Ok(())
     }
 
+    fn current_task(&self) -> Option<TaskId> {
+        *self.current_task.borrow()
+    }
+
     fn run_task(&mut self, py: Python, id: TaskId) -> PyResult<()> {
+        let prev = self.current_task();
+        *self.current_task.borrow_mut() = Some(id);
         let entry = if let Some(x) = self.tasks_hm.get_mut(&id) {
             x
         } else {
             return Ok(());
-        };
-        if entry.cancelled(py) {
+        };        if entry.cancelled(py) {
             self.pending_io.remove(&id);
             self.tasks_hm.remove(&id);
+            *self.current_task.borrow_mut() = prev;
             return Ok(());
         }
         let current_ctx = self.copy_context_method.call0(py)?;
@@ -390,6 +416,8 @@ impl EventLoop {
         let pending_val = entry.pending_val.take();
 
         let step_res = { entry.task.step(pending_val, !needs_switch, py) };
+        
+        *self.current_task.borrow_mut() = prev;
 
         self.process_step(id, step_res, py)
     }
@@ -886,8 +914,6 @@ impl EventLoop {
                     args,
                     context,
                 };
-                self.next_handle_id += 1;
-
                 self.active_handlers.insert(id, handler);
                 self.callbacks.push_back(id);
             }
@@ -903,7 +929,6 @@ impl EventLoop {
                     args,
                     context,
                 };
-                self.next_handle_id += 1;
                 self.active_handlers.insert(id, handler);
                 self.scheduled_callbacks
                     .push(ScheduledCallback { when, callback: id });
@@ -983,7 +1008,7 @@ impl EventLoop {
                 }
             }
             while let Some(cb) = self.callbacks.pop_front() {
-                if let Some(handler) = self.active_handlers.get(&cb) {
+                if let Some(handler) = self.active_handlers.remove(&cb) {
                     if let Err(e) = handler.call(py) {
                         e.print(py);
                     }
@@ -1003,6 +1028,10 @@ impl EventLoop {
             while let Ok(cmd) = self.cmd_rx.try_recv() {
                 had_events = true;
                 self.handle_command(cmd, py)?;
+            }
+
+            if let Ok(()) = self.wakeup_rx.try_recv() {
+                had_events = true;
             }
 
             let ready_timers = self.check_timers();
@@ -1103,8 +1132,20 @@ impl RustEventLoop {
         })
     }
 
+    pub fn time(&self) -> f64 {
+        self.event_loop.borrow().time()
+    }
+
     pub fn create_task(&self, gen: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyFuture>> {
         self.event_loop.borrow_mut().create_task(gen, py, None)
+    }
+
+    pub fn current_task(&self) -> Option<TaskId> {
+        self.event_loop.borrow().current_task()
+    }
+
+    pub fn wakeup(&self) -> PyResult<()> {
+        self.event_loop.borrow().wakeup()
     }
 
     pub fn call_soon(
@@ -1113,7 +1154,11 @@ impl RustEventLoop {
         args: Py<PyTuple>,
         context: Option<Py<PyAny>>,
     ) -> PyResult<usize> {
-        let id = self.event_loop.borrow().next_handle_id;
+        let id = {
+            let mut e_loop = self.event_loop.borrow_mut();
+            e_loop.next_handle_id += 1;
+            e_loop.next_handle_id - 1
+        };
         self.cmd_tx
             .send(Command::CallSoon {
                 callback,
@@ -1132,7 +1177,11 @@ impl RustEventLoop {
         args: Py<PyTuple>,
         context: Option<Py<PyAny>>,
     ) -> PyResult<usize> {
-        let id = self.event_loop.borrow().next_handle_id;
+        let id = {
+            let mut e_loop = self.event_loop.borrow_mut();
+            e_loop.next_handle_id += 1;
+            e_loop.next_handle_id - 1
+        };
         self.cmd_tx
             .send(Command::CallLater {
                 when: Instant::now() + Duration::from_secs_f64(delay),
@@ -1201,10 +1250,22 @@ impl PyEventLoop {
         })
     }
 
+    fn time(&self) -> f64 {
+        self.loop_impl.time()
+    }
+
     fn create_task(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<Py<PyFuture>> {
         let py = slf.py();
         let fut = slf.borrow().loop_impl.create_task(gen, py)?;
         Ok(fut)
+    }
+
+    fn current_task(&self) -> Option<TaskId> {
+        self.loop_impl.current_task()
+    }
+
+    fn wakeup(&self) -> PyResult<()> {
+        self.loop_impl.wakeup()
     }
 
     fn call_soon(
