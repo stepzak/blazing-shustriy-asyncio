@@ -136,12 +136,9 @@ impl Handle {
     fn call(&self, py: Python) -> PyResult<()> {
         if let Some(ctx) = &self.context {
             let args = self.args.bind(py);
-            println!("len args ctx: {}", args.len());
 
             let mut p_args: Vec<Bound<'_, PyAny>> = Vec::with_capacity(args.len() + 1);
-
             p_args.push(self.callback.clone_ref(py).into_bound(py));
-            println!("{:?}", self.callback.bind(py).repr());
             p_args.extend(args.iter());
             let final_tuple = PyTuple::new(py, p_args)?;
             ctx.call_method(
@@ -153,7 +150,6 @@ impl Handle {
             return Ok(());
         } else {
             let args = self.args.bind(py);
-            println!("len args: {}", args.len());
             self.callback.call(py, args, None)?;
             return Ok(());
         }
@@ -924,7 +920,6 @@ impl EventLoop {
     fn handle_command(&mut self, cmd: Command, py: Python) -> PyResult<()> {
         match cmd {
             Command::CreateTask { coro, tx } => {
-                println!("Creating 2");
                 let fut = self.create_task(coro.bind(py), py, None)?;
                 let _ = tx.send(fut);
             }
@@ -943,7 +938,6 @@ impl EventLoop {
                 context,
                 tx,
             } => {
-                println!("got msg");
                 let id = self.next_handle_id;
                 self.next_handle_id += 1;
                 let handler = Handle {
@@ -1039,10 +1033,13 @@ impl EventLoop {
     }
 
     fn run_forever(&mut self, py: Python) -> PyResult<()> {
-        println!("...");
         loop {
             let mut had_events = false;
             let now = Instant::now();
+            while let Ok(cmd) = self.cmd_rx.try_recv() {
+                had_events = true;
+                self.handle_command(cmd, py)?;
+            }
             while let Some(task) = self.scheduled_callbacks.peek() {
                 if task.when <= now {
                     let task = self.scheduled_callbacks.pop().unwrap();
@@ -1051,34 +1048,21 @@ impl EventLoop {
                     break;
                 }
             }
-            println!("break 1");
             while let Some(cb) = self.callbacks.pop_front() {
-                println!("{cb}");
                 if let Some(handler) = self.active_handlers.remove(&cb) {
-                    println!("Calling");
                     if let Err(e) = handler.call(py) {
-                        println!("{e:?}, {handler:?}");
                         e.print(py);
                     }
                 }
-                println!("{}", self.callbacks.len());
             }
-            println!("break 2");
             while let Ok((id, res_result)) = self.wake_rx.try_recv() {
                 had_events = true;
                 self.handle_wake(id, res_result)?;
             }
-            println!("break 3");
             while let Ok((id, result)) = self.io_rx.try_recv() {
                 had_events = true;
                 self.handle_io(id, result, py)?;
             }
-            println!("break 3");
-            while let Ok(cmd) = self.cmd_rx.try_recv() {
-                had_events = true;
-                self.handle_command(cmd, py)?;
-            }
-            println!("break 4");
             let ready_timers = self.check_timers();
             if !ready_timers.is_empty() {
                 had_events = true;
@@ -1097,7 +1081,6 @@ impl EventLoop {
                     break;
                 }
             }
-            println!("{had_events}");
             if !had_events {
                 py.check_signals()?;
                 let sleep_duration = match self.next_timer {
@@ -1144,7 +1127,6 @@ impl EventLoop {
     fn run_until_complete(&mut self, coro: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
         self.create_task(coro, py, None)?;
         let id = self.next_id - 1;
-        println!("{id}");
         self.schedule_task(id);
         self.run_forever(py)
     }
@@ -1197,7 +1179,6 @@ impl RustEventLoop {
     pub fn create_task(&self, gen: &Bound<'_, PyAny>) -> PyResult<Py<PyFuture>> {
         let (response_tx, response_rx) = oneshot::channel();
         let unbound = gen.clone().unbind();
-        println!("Creating 1");
         self.cmd_tx
             .send(Command::CreateTask {
                 coro: unbound,
@@ -1248,7 +1229,6 @@ impl RustEventLoop {
                     tx: response_tx,
                 })
                 .map_err(|_| PyRuntimeError::new_err("Event loop closed"))?;
-            println!("sent");
             match response_rx.blocking_recv() {
                 Ok(res) => Ok(res),
                 Err(_) => Err(PyRuntimeError::new_err("Event loop is closed")),
@@ -1331,7 +1311,6 @@ impl RustEventLoop {
     }
 
     pub fn run_until_complete(&self, coro: &Bound<'_, PyAny>, py: Python) -> PyResult<()> {
-        println!("Running forever");
         self.event_loop.borrow_mut().run_until_complete(coro, py)
     }
 
@@ -1401,9 +1380,9 @@ impl PyEventLoop {
         self.loop_impl.cancel_handle(handle_id)
     }
 
-    fn spawn(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<()> {
-        slf.borrow().loop_impl.spawn(gen)?;
-        Ok(())
+    fn spawn(slf: &Bound<'_, Self>, gen: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let task_id = slf.borrow().loop_impl.spawn(gen)?;
+        Ok(task_id)
     }
 
     fn run_forever(&self, py: Python) -> PyResult<()> {

@@ -120,7 +120,6 @@ class BlazingEventLoop(asyncio.AbstractEventLoop):
     
     def call_soon(self, callback: Callable, *args: Any, context: Optional[contextvars.Context] = None) -> BlazingHandle:
         self._check_closed()
-        
         if context is None:
             context = contextvars.copy_context()
         
@@ -135,7 +134,6 @@ class BlazingEventLoop(asyncio.AbstractEventLoop):
     
     def call_at(self, when: float, callback: Callable, *args: Any, context: Optional[contextvars.Context] = None) -> BlazingHandle:
         self._check_closed()
-        
         if context is None:
             context = contextvars.copy_context()
         
